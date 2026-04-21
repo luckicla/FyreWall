@@ -8,7 +8,7 @@ Gestor de Firewall, Monitor de Puertos, **Bloqueo Anti-Vigilancia de Aula** y Mo
 
 | Pestaña     | Comando     | Descripción                                      |
 |-------------|-------------|--------------------------------------------------|
-| ⌨️ Terminal  | (siempre)   | Consola de comandos. No se puede cerrar.         |
+| ⌨️ Terminal  | (siempre)   | Consola de comandos.                            |
 | 🔍 Monitor  | `monitor`   | Debug Monitor de conexiones activas              |
 | 🏫 Aula     | `aula`      | Bloqueo de Faronics Insight y Reboot Restore     |
 | 📡 Peticiones | `peticiones` | Monitor visual de peticiones de red en vivo    |
