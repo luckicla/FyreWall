@@ -342,18 +342,10 @@ def _run(args: list[str]) -> tuple[bool, str]:
         return False, str(e)
 
 
-def _rule_exists(rule_name: str) -> bool:
-    """Check if a firewall rule with this exact name already exists."""
-    ok, out = _run([
-        "netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}",
-    ])
-    return ok and "No rules match" not in out and rule_name in out
-
-
 def cmd_block_port(port: int, proto: str = "TCP", direction: str = "in") -> tuple[bool, str, str]:
     name = f"{RULE_PREFIX}Block_{proto}_{direction.upper()}_{port}"
     if _rule_exists(name):
-        return True, "ya existe", name
+        return True, "already_exists", name
     ok, msg = _run([
         "netsh", "advfirewall", "firewall", "add", "rule",
         f"name={name}", f"protocol={proto.upper()}", f"dir={direction}",
@@ -381,56 +373,80 @@ def cmd_block_app(path: str) -> tuple[bool, str]:
     return ok, msg
 
 
-def cmd_list_rules() -> dict:
-    """List all ports/rules blocked by FyreWall."""
-    # netsh wildcard 'name=FyreWall_*' does NOT work — must dump all and filter
-    ok, out = _run([
-        "netsh", "advfirewall", "firewall", "show", "rule", "name=all",
-    ])
-    if not ok or not out.strip():
-        return {}
-
-    # Parse into structured port list, keeping only FyreWall_ rules
+def _parse_netsh_rules(out: str, prefix_filter: str = "") -> dict:
+    """
+    Parse output of 'netsh advfirewall firewall show rule name=...'
+    into a dict keyed by 'port/proto'.
+    Flushes on each new 'Rule Name:' AND at end to avoid dropping last rule.
+    prefix_filter: if set, only keeps rules whose name starts with this string.
+    """
     ports_found = {}
-    current_name = None
-    current_proto = None
-    current_port = None
-    current_dir = None
-    current_action = None
+    cur = {}
 
     def _flush():
-        nonlocal current_name, current_proto, current_port, current_dir, current_action
-        if current_name and current_name.startswith(RULE_PREFIX):
-            if current_port and current_port not in ("Any", "any", ""):
-                key = f"{current_port}/{current_proto or 'ANY'}"
-                if key not in ports_found:
-                    ports_found[key] = {
-                        "name": current_name,
-                        "port": current_port,
-                        "proto": current_proto or "ANY",
-                        "dirs": [],
-                        "action": current_action or "Block",
-                    }
-                if current_dir and current_dir not in ports_found[key]["dirs"]:
-                    ports_found[key]["dirs"].append(current_dir)
-        current_name = current_proto = current_port = current_dir = current_action = None
+        name = cur.get("name", "")
+        if not name:
+            return
+        if prefix_filter and not name.startswith(prefix_filter):
+            return
+        port = cur.get("port", "")
+        if not port or port.lower() in ("any", ""):
+            return
+        proto = cur.get("proto", "ANY")
+        direction = cur.get("dir", "")
+        key = f"{port}/{proto}"
+        if key not in ports_found:
+            ports_found[key] = {
+                "name": name,
+                "port": port,
+                "proto": proto,
+                "dirs": [],
+                "action": cur.get("action", "Block"),
+            }
+        if direction and direction not in ports_found[key]["dirs"]:
+            ports_found[key]["dirs"].append(direction)
 
     for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("Rule Name:"):
+        s = line.strip()
+        if s.startswith("Rule Name:"):
             _flush()
-            current_name = line.split(":", 1)[1].strip()
-        elif line.startswith("Protocol:"):
-            current_proto = line.split(":", 1)[1].strip()
-        elif line.startswith("LocalPort:") or line.startswith("Local Port:"):
-            current_port = line.split(":", 1)[1].strip()
-        elif line.startswith("Direction:"):
-            current_dir = line.split(":", 1)[1].strip()
-        elif line.startswith("Action:"):
-            current_action = line.split(":", 1)[1].strip()
-
-    _flush()  # flush last rule
+            cur = {"name": s.split(":", 1)[1].strip()}
+        elif s.startswith("Protocol:"):
+            cur["proto"] = s.split(":", 1)[1].strip()
+        elif s.startswith("LocalPort:") or s.startswith("Local Port:"):
+            cur["port"] = s.split(":", 1)[1].strip()
+        elif s.startswith("Direction:"):
+            cur["dir"] = s.split(":", 1)[1].strip()
+        elif s.startswith("Action:"):
+            cur["action"] = s.split(":", 1)[1].strip()
+    _flush()  # flush last rule — no trailing blank line in netsh output
     return ports_found
+
+
+def cmd_list_rules() -> dict:
+    """List all FyreWall rules. Returns {} if none or on error."""
+    ok, out = _run([
+        "netsh", "advfirewall", "firewall", "show", "rule",
+        f"name={RULE_PREFIX}*",
+    ])
+    if ok and out.strip():
+        return _parse_netsh_rules(out, prefix_filter=RULE_PREFIX)
+    # Exit code 1 + 'No rules match' = no rules exist, that's normal
+    if not ok and out and "No rules match" in out:
+        return {}
+    # Fallback: dump everything and filter manually
+    ok2, out2 = _run(["netsh", "advfirewall", "firewall", "show", "rule", "name=all"])
+    if not ok2 or not out2.strip():
+        return {}
+    return _parse_netsh_rules(out2, prefix_filter=RULE_PREFIX)
+
+
+def _rule_exists(rule_name: str) -> bool:
+    """Return True if a firewall rule with this exact name already exists."""
+    ok, out = _run([
+        "netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}",
+    ])
+    return ok and "No rules match" not in out
 
 
 def cmd_flush_all() -> tuple[bool, str]:
@@ -579,7 +595,7 @@ CLASSROOM_PROCESSES = {
 def _block_port_range(port_range: str, proto: str, direction: str, rule_name: str) -> tuple[bool, str]:
     full_name = f"{RULE_PREFIX}{rule_name}"
     if _rule_exists(full_name):
-        return True, "ya existe"
+        return True, "already_exists"
     ok, msg = _run([
         "netsh", "advfirewall", "firewall", "add", "rule",
         f"name={full_name}", f"protocol={proto.upper()}", f"dir={direction}",
@@ -589,6 +605,11 @@ def _block_port_range(port_range: str, proto: str, direction: str, rule_name: st
 
 
 def apply_classroom_block(app_key: str, log_callback=None) -> dict:
+    """
+    Block all ports/processes for app_key.
+    Rules are named exactly as in CLASSROOM_RULES so remove_classroom_block
+    can find and delete them by the same name.
+    """
     rules = CLASSROOM_RULES.get(app_key, [])
     results = {"ok": 0, "fail": 0, "skipped": 0, "messages": []}
 
@@ -597,65 +618,60 @@ def apply_classroom_block(app_key: str, log_callback=None) -> dict:
         if log_callback:
             log_callback(msg)
 
-    # ── 1. Stop & disable services first ─────────────────────────────────
-    log("  🛑 Deteniendo servicios...")
-    found_any_service = False
+    # ── 1. Stop & disable services ────────────────────────────────────────
+    found_svc = False
     for svc in CLASSROOM_SERVICES.get(app_key, []):
         status = check_service_status(svc)
         if status == "running":
-            found_any_service = True
+            found_svc = True
             _run(["sc", "stop", svc])
             _run(["sc", "config", svc, "start=", "disabled"])
             log(f"  🛑 Servicio detenido y deshabilitado: {svc}")
         elif status == "stopped":
-            found_any_service = True
+            found_svc = True
             _run(["sc", "config", svc, "start=", "disabled"])
             log(f"  ⏹️  Servicio ya detenido, deshabilitado: {svc}")
-    if not found_any_service:
-        log("  ℹ️  No se encontraron servicios activos (puede que no esté instalado).")
+    if not found_svc:
+        log("  ℹ️  No se detectaron servicios instalados.")
 
-    # ── 2. Kill running processes ─────────────────────────────────────────
-    for proc in CLASSROOM_PROCESSES.get(app_key, []):
-        ok, msg = cmd_block_process(proc)
-        if ok:
-            results["ok"] += 1
-            log(f"  ✅ Proceso bloqueado: {proc}")
-        else:
-            log(f"  ℹ️  Proceso no activo: {proc}")
-
-    # ── 3. Apply firewall rules ───────────────────────────────────────────
-    log("  🔒 Aplicando reglas de firewall...")
+    # ── 2. Apply firewall rules using the names defined in CLASSROOM_RULES ─
+    # IMPORTANT: must use CLASSROOM_RULES names directly so remove_classroom_block
+    # can delete them by the same name. Do NOT use cmd_block_port here.
     for rule in rules:
-        name = rule["name"]
-        proto = rule["proto"]
+        full_name = f"{RULE_PREFIX}{rule['name']}"
+        proto     = rule["proto"]
         direction = rule["dir"]
-        full_name = f"{RULE_PREFIX}{name}"
 
-        # Check if rule already exists — skip silently
+        # Skip if rule already exists
         if _rule_exists(full_name):
             results["skipped"] += 1
             results["ok"] += 1
-            if "port_range" in rule:
-                label = f"{proto} {rule['port_range']} {direction.upper()}"
-            else:
-                label = f"{proto} {rule['port']} {direction.upper()}"
-            log(f"  ⏭️  Ya existía: {label}")
+            port_label = rule.get("port_range") or str(rule.get("port"))
+            log(f"  ⏭️  Ya existía: {proto} {port_label} {direction.upper()}")
             continue
 
-        if "port_range" in rule:
-            ok, msg = _block_port_range(rule["port_range"], proto, direction, name)
-            label = f"{proto} {rule['port_range']} {direction.upper()}"
-        else:
-            port = rule["port"]
-            ok, msg, _ = cmd_block_port(port, proto, direction)
-            label = f"{proto} {port} {direction.upper()}"
-
+        port_spec = rule.get("port_range") or str(rule["port"])
+        ok, msg = _run([
+            "netsh", "advfirewall", "firewall", "add", "rule",
+            f"name={full_name}", f"protocol={proto.upper()}", f"dir={direction}",
+            f"localport={port_spec}", "action=block",
+        ])
+        label = f"{proto} {port_spec} {direction.upper()}"
         if ok:
             results["ok"] += 1
             log(f"  ✅ Bloqueado: {label}  →  {full_name}")
         else:
             results["fail"] += 1
             log(f"  ❌ Error {label}: {msg[:80]}")
+
+    # ── 3. Block processes ────────────────────────────────────────────────
+    for proc in CLASSROOM_PROCESSES.get(app_key, []):
+        ok, msg = cmd_block_process(proc)
+        if ok:
+            results["ok"] += 1
+            log(f"  ✅ Proceso bloqueado: {proc}")
+        else:
+            log(f"  ℹ️  Proceso no activo o no encontrado: {proc}")
 
     return results
 
@@ -720,20 +736,19 @@ def create_persistent_startup_task(app_key: str) -> tuple[bool, str]:
 
 
 def disable_classroom_services(app_key: str) -> list[str]:
-    results = []
+    msgs = []
     for svc in CLASSROOM_SERVICES.get(app_key, []):
         status = check_service_status(svc)
         if status == "not_found":
-            results.append(f"  ℹ️  Servicio no encontrado: {svc}")
+            msgs.append(f"  ℹ️  Servicio no encontrado: {svc}")
             continue
-        # Stop first, then disable
         _run(["sc", "stop", svc])
-        ok, msg = _run(["sc", "config", svc, "start=", "disabled"])
+        ok, err = _run(["sc", "config", svc, "start=", "disabled"])
         if ok:
-            results.append(f"  ✅ Servicio deshabilitado y detenido: {svc}")
+            msgs.append(f"  ✅ Servicio detenido y deshabilitado: {svc}")
         else:
-            results.append(f"  ⚠️  Error al deshabilitar {svc}: {msg[:60]}")
-    return results
+            msgs.append(f"  ⚠️  No se pudo deshabilitar {svc}: {err[:60]}")
+    return msgs
 
 
 # ─── CONSOLE COMMAND PARSER ──────────────────────────────────────────────────
@@ -984,8 +999,9 @@ def parse_and_run(command: str) -> tuple[str, str]:
             return f"Dirección inválida: '{direction}'.", "error"
         ok, msg, name = cmd_block_port(port, proto, direction)
         if ok:
-            if msg == "ya existe":
-                return f"ℹ️  Puerto {port}/{proto} ({direction}) ya estaba bloqueado.\n    Regla: {name}", "warn"
+            if msg == "already_exists":
+                return (f"ℹ️  Puerto {port}/{proto} ({direction}) ya estaba bloqueado.\n"
+                        f"    Regla: {name}"), "warn"
             return f"✅  Puerto {port}/{proto} bloqueado ({direction}).\n    Regla: {name}", "ok"
         return f"❌  Error al bloquear puerto {port}:\n{msg}", "error"
 
@@ -2999,16 +3015,17 @@ class FyreWallApp(tk.Tk):
                 total = results["ok"] + results["fail"]
                 skipped = results.get("skipped", 0)
                 new_rules = results["ok"] - skipped
-                if results["fail"] == 0:
+                if results["fail"] == 0 and results["ok"] > 0:
                     self._classroom_log_write(
-                        f"\n✅ Completado: {results['ok']}/{total} reglas OK "
-                        f"({new_rules} nuevas, {skipped} ya existían).", "ok")
-                else:
+                        f"\n✅ Completado: {new_rules} reglas nuevas, {skipped} ya existían.", "ok")
+                elif results["ok"] > 0:
                     self._classroom_log_write(
                         f"\n⚠️  Completado con errores: {results['ok']} OK / {results['fail']} fallidas.", "warn")
+                else:
+                    self._classroom_log_write(
+                        f"\n❌ No se aplicó ninguna regla ({results['fail']} errores). ¿Modo Administrador?", "error")
                 self._classroom_log_write(
                     "💡 Recuerda crear la tarea de inicio para persistencia tras reinicio.", "warn")
-                # Only update status to BLOQUEADO if at least some rules were applied
                 if results["ok"] > 0:
                     if app_key == "insight":
                         self._insight_blocked = True
@@ -3020,8 +3037,6 @@ class FyreWallApp(tk.Tk):
                         self._rr_status_label.config(fg=COLORS["danger"])
                     self._status_text.set(f"✅  {app_name} bloqueado")
                 else:
-                    self._classroom_log_write(
-                        f"❌ No se pudo aplicar ninguna regla. ¿Tienes permisos de Administrador?", "error")
                     self._status_text.set(f"❌  Error bloqueando {app_name}")
             self.after(0, done)
 
