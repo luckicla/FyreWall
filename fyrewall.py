@@ -188,7 +188,7 @@ SUSPICIOUS_PORTS = {
     8889:  ("🎓  Insight WS-2",     "screen_share",  "Faronics Insight WebSocket"),
     8890:  ("🎓  Insight WS-3",     "screen_share",  "Faronics Insight WebSocket"),
     9000:  ("🔄  RR Endpoint",      "screen_share",  "Reboot Restore Enterprise Endpoint"),
-    5901:  ("🔄  RR VNC",           "screen_share",  "Reboot Restore VNC"),
+    # 5901 ya está definido arriba como VNC-1; Reboot Restore usa también 5900 (entrada propia)
     # ── File sharing ─────────────────────────────────────────────────────
     445:   ("📁  SMB",             "file_share",    "Compartir archivos Windows (SMB/CIFS)"),
     139:   ("📁  NetBIOS",         "file_share",    "NetBIOS Session Service (archivos legacy)"),
@@ -230,28 +230,44 @@ CATEGORY_NAMES = {
 
 
 def scan_suspicious_ports() -> dict:
-    """Scan active connections and match against suspicious port list."""
+    """Scan active connections and match against suspicious port list.
+    Checks both local_port AND remote_port so background services that
+    connect outbound (e.g. Faronics Insight Student, Reboot Restore) are detected.
+    """
     conns = scan_connections()
     findings: dict[str, list[dict]] = {"screen_share": [], "file_share": [], "telemetry": []}
     seen = set()
 
     for c in conns:
-        port = c["local_port"]
-        if port in SUSPICIOUS_PORTS:
-            icon, category, reason = SUSPICIOUS_PORTS[port]
-            key = (port, c["process"])
-            if key in seen:
-                continue
-            seen.add(key)
-            findings[category].append({
-                "port":    port,
-                "icon":    icon,
-                "reason":  reason,
-                "process": c["process"],
-                "pid":     c["pid"],
-                "state":   c["state"],
-                "proto":   c["proto"],
-            })
+        # Check local_port first, then remote_port as fallback
+        matched_port = None
+        if c["local_port"] in SUSPICIOUS_PORTS:
+            matched_port = c["local_port"]
+        else:
+            try:
+                rport = int(c["remote_port"])
+                if rport in SUSPICIOUS_PORTS:
+                    matched_port = rport
+            except (ValueError, TypeError):
+                pass
+
+        if matched_port is None:
+            continue
+
+        icon, category, reason = SUSPICIOUS_PORTS[matched_port]
+        key = (matched_port, c["process"])
+        if key in seen:
+            continue
+        seen.add(key)
+        findings[category].append({
+            "port":    matched_port,
+            "icon":    icon,
+            "reason":  reason,
+            "process": c["process"],
+            "pid":     c["pid"],
+            "state":   c["state"],
+            "proto":   c["proto"],
+        })
 
     return findings
 
@@ -406,19 +422,41 @@ def _parse_netsh_rules(out: str, prefix_filter: str = "") -> dict:
         if direction and direction not in ports_found[key]["dirs"]:
             ports_found[key]["dirs"].append(direction)
 
+    # netsh field names differ by Windows locale; support EN and ES
+    _FIELD_RULE   = ("Rule Name:",    "Nombre de regla:")
+    _FIELD_PROTO  = ("Protocol:",     "Protocolo:")
+    _FIELD_PORT   = ("LocalPort:",    "Local Port:", "Puerto local:")
+    _FIELD_DIR    = ("Direction:",    "Dirección:")
+    _FIELD_ACTION = ("Action:",       "Acción:")
+
+    def _get_value(s, prefixes):
+        for p in prefixes:
+            if s.startswith(p):
+                return s[len(p):].strip()
+        return None
+
     for line in out.splitlines():
         s = line.strip()
-        if s.startswith("Rule Name:"):
+        v = _get_value(s, _FIELD_RULE)
+        if v is not None:
             _flush()
-            cur = {"name": s.split(":", 1)[1].strip()}
-        elif s.startswith("Protocol:"):
-            cur["proto"] = s.split(":", 1)[1].strip()
-        elif s.startswith("LocalPort:") or s.startswith("Local Port:"):
-            cur["port"] = s.split(":", 1)[1].strip()
-        elif s.startswith("Direction:"):
-            cur["dir"] = s.split(":", 1)[1].strip()
-        elif s.startswith("Action:"):
-            cur["action"] = s.split(":", 1)[1].strip()
+            cur = {"name": v}
+            continue
+        v = _get_value(s, _FIELD_PROTO)
+        if v is not None:
+            cur["proto"] = v
+            continue
+        v = _get_value(s, _FIELD_PORT)
+        if v is not None:
+            cur["port"] = v
+            continue
+        v = _get_value(s, _FIELD_DIR)
+        if v is not None:
+            cur["dir"] = v
+            continue
+        v = _get_value(s, _FIELD_ACTION)
+        if v is not None:
+            cur["action"] = v
     _flush()  # flush last rule — no trailing blank line in netsh output
     return ports_found
 
@@ -651,6 +689,8 @@ def apply_classroom_block(app_key: str, log_callback=None) -> dict:
             continue
 
         port_spec = rule.get("port_range") or str(rule["port"])
+
+        # Block by localport
         ok, msg = _run([
             "netsh", "advfirewall", "firewall", "add", "rule",
             f"name={full_name}", f"protocol={proto.upper()}", f"dir={direction}",
@@ -659,10 +699,28 @@ def apply_classroom_block(app_key: str, log_callback=None) -> dict:
         label = f"{proto} {port_spec} {direction.upper()}"
         if ok:
             results["ok"] += 1
-            log(f"  ✅ Bloqueado: {label}  →  {full_name}")
+            log(f"  ✅ Bloqueado (localport): {label}  →  {full_name}")
         else:
             results["fail"] += 1
-            log(f"  ❌ Error {label}: {msg[:80]}")
+            log(f"  ❌ Error (localport) {label}: {msg[:80]}")
+
+        # Also block by remoteport so outbound connections to the server are blocked too
+        remote_name = f"{full_name}_REMOTE"
+        if not _rule_exists(remote_name):
+            ok2, msg2 = _run([
+                "netsh", "advfirewall", "firewall", "add", "rule",
+                f"name={remote_name}", f"protocol={proto.upper()}", f"dir={direction}",
+                f"remoteport={port_spec}", "action=block",
+            ])
+            if ok2:
+                results["ok"] += 1
+                log(f"  ✅ Bloqueado (remoteport): {label}  →  {remote_name}")
+            else:
+                # remoteport is not always valid (e.g. for UDP inbound), ignore silently
+                pass
+        else:
+            results["skipped"] += 1
+            results["ok"] += 1
 
     # ── 3. Block processes ────────────────────────────────────────────────
     for proc in CLASSROOM_PROCESSES.get(app_key, []):
