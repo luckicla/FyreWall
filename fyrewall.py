@@ -2140,9 +2140,9 @@ class FyreWallApp(tk.Tk):
         tk.Button(
             btn_frame, text="🔓  Desbloquear",
             command=lambda k=app_key: self._classroom_unblock(k),
-            bg=COLORS["btn"], fg=COLORS["text_muted"],
-            font=("Segoe UI", 9), relief="flat", cursor="hand2",
-            padx=10, pady=5, activebackground=COLORS["btn_hover"],
+            bg=COLORS["console_ok"], fg="#ffffff",
+            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+            padx=10, pady=5, activebackground=COLORS["green_active"],
         ).pack(side="left", padx=(8, 0))
 
         tk.Button(
