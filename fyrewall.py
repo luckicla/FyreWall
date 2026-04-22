@@ -837,6 +837,7 @@ COMMANDS = [
     ("aula",               "aula — abre el Bloqueo de Aula"),
     ("clear",              "clear — limpia la consola"),
     ("help",               "help — muestra ayuda"),
+    ("fyre-manager",       "fyre-manager — abre el gestor de paquetes FyreManager"),
 ]
 
 # Directory where the app lives (for ls / run-bat)
@@ -1115,6 +1116,14 @@ def parse_and_run(command: str) -> tuple[str, str]:
                 icon = "🔒 BLOQUEADO" if active else "🔓 libre"
                 results.append(f"  {proto} {direction:3s}: {icon}")
         return f"Estado del puerto {port}:\n" + "\n".join(results), "info"
+
+    if cmd == "fyre-manager":
+        return "__OPEN_FYRE_MANAGER__", "info"
+
+    # ── Plugin commands injected by FyreManager packages ──────────────────
+    result = _plugin_dispatch(cmd, parts)
+    if result is not None:
+        return result
 
     return f"Comando desconocido: '{cmd}'\nEscribe 'help' para ver los comandos disponibles.", "warn"
 
@@ -1706,6 +1715,7 @@ class FyreWallApp(tk.Tk):
             ("🔍", "monitor", "Monitor"),
             ("🏫", "aula", "Aula"),
             ("📡", "peticiones", "Peticiones"),
+            ("📦", "fyre-manager", "Packages"),
         ]
         for icon, tid, label in open_tabs:
             tk.Button(
@@ -1740,6 +1750,9 @@ class FyreWallApp(tk.Tk):
         """Open a tab or activate if already open."""
         if tab_id == "peticiones" and tab_id not in self._tab_frames:
             frame = RequestsTab(self._content, self)
+            self._tab_frames[tab_id] = frame
+        if tab_id == "fyre-manager" and tab_id not in self._tab_frames:
+            frame = FyreManagerTab(self._content, self)
             self._tab_frames[tab_id] = frame
 
         self._tab_bar.add_tab(tab_id, label)
@@ -1786,10 +1799,11 @@ class FyreWallApp(tk.Tk):
         self._empty_state.lift()
 
     def _on_tab_close(self, tab_id: str):
-        if tab_id == "peticiones" and tab_id in self._tab_frames:
+        closeable = {"peticiones", "batch", "fyre-manager"}
+        if tab_id in closeable and tab_id in self._tab_frames:
             self._tab_frames[tab_id].destroy()
             del self._tab_frames[tab_id]
-        elif tab_id == "batch" and tab_id in self._tab_frames:
+        elif tab_id.startswith("plugin_") and tab_id in self._tab_frames:
             self._tab_frames[tab_id].destroy()
             del self._tab_frames[tab_id]
         self._tab_bar.remove_tab(tab_id)
@@ -2329,6 +2343,9 @@ class FyreWallApp(tk.Tk):
     # ── Boot ───────────────────────────────────────────────────────────────
 
     def _boot(self):
+        # Load installed plugins before opening terminal
+        _load_all_plugins()
+
         # Open only the terminal tab at start
         self._open_tab("terminal", "⌨️ Terminal")
 
@@ -2641,6 +2658,15 @@ class FyreWallApp(tk.Tk):
             return
         if output == "__GET_BAT__":
             self._do_get_bat()
+            return
+        if output == "__OPEN_FYRE_MANAGER__":
+            self._open_fyre_manager_tab()
+            self._console_write("📦  FyreManager abierto.", "ok")
+            return
+        if isinstance(output, str) and output.startswith("__PLUGIN_TAB__"):
+            info = output[len("__PLUGIN_TAB__"):]
+            fname, cmd_name = info.split("::", 1) if "::" in info else (info, "")
+            self._open_plugin_tab(fname, cmd_name)
             return
         if isinstance(output, str) and output.startswith("__RUN_BAT__"):
             bat_path = output[len("__RUN_BAT__"):]
@@ -3166,6 +3192,55 @@ class FyreWallApp(tk.Tk):
 
         threading.Thread(target=run, daemon=True).start()
 
+    # ── FyreManager Tab ────────────────────────────────────────────────────
+
+    def _open_fyre_manager_tab(self):
+        if "fyre-manager" not in self._tab_frames:
+            frame = FyreManagerTab(self._content, self)
+            self._tab_frames["fyre-manager"] = frame
+        self._tab_bar.add_tab("fyre-manager", "📦 FyreManager")
+
+    def _open_plugin_tab(self, fname: str, cmd_name: str):
+        """Open a plugin's UI in a new tab."""
+        entry = _PLUGINS.get(fname)
+        if not entry:
+            self._console_write(f"❌  Plugin no cargado: {fname}", "error")
+            return
+        mod = entry["module"]
+        manifest = entry["manifest"]
+        # Find the command handler
+        handler_fn = None
+        for c in manifest.get("commands", []):
+            if c.get("name", "") == cmd_name:
+                handler_fn = c.get("tab_builder")
+                break
+        tab_id = f"plugin_{fname}_{cmd_name}"
+        if tab_id not in self._tab_frames:
+            if handler_fn and callable(getattr(mod, handler_fn, None)):
+                frame = tk.Frame(self._content, bg=COLORS["bg"])
+                try:
+                    getattr(mod, handler_fn)(frame, self)
+                except Exception as e:
+                    tk.Label(frame, text=f"❌ Error al construir UI del plugin:\n{e}",
+                             font=FONTS["body"], bg=COLORS["bg"], fg=COLORS["danger"],
+                             pady=30).pack()
+            else:
+                frame = tk.Frame(self._content, bg=COLORS["bg"])
+                tk.Label(frame,
+                         text=f"📦 Paquete: {fname}\nComando: {cmd_name}\n\n(Sin tab_builder definido en el manifest)",
+                         font=FONTS["body"], bg=COLORS["bg"], fg=COLORS["text_muted"],
+                         pady=40).pack()
+            self._tab_frames[tab_id] = frame
+        label = f"📦 {cmd_name}"
+        self._tab_bar.add_tab(tab_id, label)
+        # Clean up on close
+        orig_close = self._on_tab_close
+        def patched_close(tid, _orig=orig_close):
+            if tid == tab_id and tid in self._tab_frames:
+                self._tab_frames[tid].destroy()
+                del self._tab_frames[tid]
+            _orig(tid)
+
     # ── Fake preview ──────────────────────────────────────────────────────
 
     # ── Window helpers ────────────────────────────────────────────────────
@@ -3175,6 +3250,878 @@ class FyreWallApp(tk.Tk):
         w, h = 1180, 780
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+
+# ─── FYRE MANAGER — PACKAGE SYSTEM ───────────────────────────────────────────
+
+FYRE_MANAGER_ASCII = """ ▄▄▄▄▄▄▄                ▄▄▄     ▄▄▄                                    
+ █▀██▀▀▀                 ███▄ ▄███                                     
+   ██        ▄           ██ ▀█▀ ██         ▄              ▄▄       ▄   
+   ███▀██ ██ ████▄▄█▀█▄  ██     ██   ▄▀▀█▄ ████▄ ▄▀▀█▄ ▄████ ▄█▀█▄ ████▄
+ ▄ ██  ██▄██ ██   ██▄█▀  ██     ██   ▄█▀██ ██ ██ ▄█▀██ ██ ██ ██▄█▀ ██  
+ ▀██▀ ▄▄▀██▀▄█▀  ▄▀█▄▄▄ ▀██▀  ▀██▄▄▀█▄██▄██ ▀█▄▀█▄██▄▀████▄▀█▄▄▄▄█▀  
+         ██                                               ██           
+       ▀▀▀                                              ▀▀▀            """
+
+FYRE_MANAGER_WELCOME = """
+  Package Manager para FyreWall — gestiona plugins y comandos externos
+  ─────────────────────────────────────────────────────────────────────
+  import          Importa un paquete .py al directorio de FyreWall
+  delete <nombre> Elimina un paquete importado
+  ls              Lista los paquetes instalados (.py)
+  run <nombre>    Ejecuta / lanza un paquete extra instalado
+  run-ui          Abre la interfaz gráfica del gestor
+  info <nombre>   Muestra el manifest de un paquete
+  reload          Recarga todos los paquetes instalados
+  help            Muestra esta ayuda
+  clear           Limpia la consola
+"""
+
+# ── Plugin registry ───────────────────────────────────────────────────────────
+
+_PLUGINS: dict[str, dict] = {}   # filename → {manifest, module, path}
+
+
+def _load_plugin(py_path: str) -> tuple[bool, str, dict]:
+    """Load a .py file, extract FYRE_MANIFEST, register its commands.
+    Returns (ok, error_msg, manifest_or_empty)."""
+    import importlib.util, types
+    fname = os.path.basename(py_path)
+    protected = {"fyrewall.py", "fyremanager.py"}
+    if fname.lower() in protected:
+        return False, f"No se puede cargar el archivo protegido: {fname}", {}
+    try:
+        spec = importlib.util.spec_from_file_location(f"fyre_pkg_{fname[:-3]}", py_path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return False, f"Error al cargar {fname}: {e}", {}
+
+    manifest = getattr(mod, "FYRE_MANIFEST", None)
+    if manifest is None:
+        return False, f"{fname} no tiene FYRE_MANIFEST — no es un paquete FyreWall.", {}
+
+    _PLUGINS[fname] = {"manifest": manifest, "module": mod, "path": py_path}
+    return True, "", manifest
+
+
+def _load_all_plugins():
+    """Scan APP_DIR for .py files with FYRE_MANIFEST and load them."""
+    protected = {"fyrewall.py", "fyremanager.py"}
+    try:
+        files = [f for f in os.listdir(APP_DIR)
+                 if f.lower().endswith(".py") and f.lower() not in protected]
+    except Exception:
+        return
+    for f in files:
+        path = os.path.join(APP_DIR, f)
+        ok, _, _ = _load_plugin(path)
+        # Silently skip non-package py files
+
+
+def _plugin_dispatch(cmd: str, parts: list[str]) -> tuple[str, str] | None:
+    """Check if cmd matches any plugin command. Return (output, level) or None."""
+    for fname, entry in _PLUGINS.items():
+        manifest = entry["manifest"]
+        mod      = entry["module"]
+        for cmd_def in manifest.get("commands", []):
+            if cmd_def.get("name", "").lower() == cmd.lower():
+                kind = cmd_def.get("kind", "inline")  # "inline" or "tab"
+                handler = cmd_def.get("handler")
+                if kind == "tab":
+                    return f"__PLUGIN_TAB__{fname}::{cmd}", "info"
+                if handler and callable(getattr(mod, handler, None)):
+                    try:
+                        result = getattr(mod, handler)(parts[1:] if len(parts) > 1 else [])
+                        if isinstance(result, tuple):
+                            return result
+                        return str(result), "info"
+                    except Exception as e:
+                        return f"❌ Error en plugin {fname}: {e}", "error"
+                return f"ℹ️  Comando '{cmd}' de paquete '{fname}' no tiene handler.", "warn"
+    return None
+
+
+def _get_plugin_commands_for_autocomplete() -> list[tuple[str, str]]:
+    """Return list of (cmd_name, description) from all loaded plugins."""
+    result = []
+    for fname, entry in _PLUGINS.items():
+        for cmd_def in entry["manifest"].get("commands", []):
+            name = cmd_def.get("name", "")
+            desc = cmd_def.get("description", f"[paquete {fname}]")
+            if name:
+                result.append((name, desc))
+    return result
+
+
+# ─── FYRE MANAGER TAB ────────────────────────────────────────────────────────
+
+class FyreManagerTab(tk.Frame):
+    """FyreManager package manager tab — CLI + GUI modes."""
+
+    FM_COMMANDS = [
+        ("import",    "import — importa un paquete .py"),
+        ("delete ",   "delete <nombre> — elimina un paquete"),
+        ("ls",        "ls — lista los paquetes instalados"),
+        ("run ",      "run <nombre> — ejecuta un paquete extra"),
+        ("run-ui",    "run-ui — abre la interfaz gráfica"),
+        ("info ",     "info <nombre> — detalles del paquete"),
+        ("reload",    "reload — recarga todos los paquetes"),
+        ("help",      "help — muestra la ayuda"),
+        ("clear",     "clear — limpia la consola"),
+    ]
+
+    def __init__(self, parent, app_ref, **kwargs):
+        super().__init__(parent, bg=COLORS["bg"], **kwargs)
+        self._app = app_ref
+        self._history: list[str] = []
+        self._hist_idx = -1
+        self._autocomplete_popup: tk.Toplevel | None = None
+        self._ui_mode = False
+        self._build()
+
+    # ── Build ─────────────────────────────────────────────────────────────
+
+    def _build(self):
+        # Header
+        hdr = tk.Frame(self, bg=COLORS["surface"], pady=8, padx=14)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="📦 FyreManager",
+                 font=FONTS["title"],
+                 bg=COLORS["surface"], fg=COLORS["accent"]).pack(side="left")
+        tk.Label(hdr, text="Gestor de paquetes — FyreWall Package Manager",
+                 font=FONTS["subtitle"],
+                 bg=COLORS["surface"], fg=COLORS["text_muted"]).pack(side="left", padx=10)
+
+        # Console area (CLI mode)
+        self._cli_frame = tk.Frame(self, bg=COLORS["bg"])
+        self._cli_frame.pack(fill="both", expand=True)
+
+        out_frame = tk.Frame(self._cli_frame, bg=COLORS["console_bg"])
+        out_frame.pack(fill="both", expand=True, padx=10, pady=(8, 0))
+
+        self._out = tk.Text(
+            out_frame,
+            bg=COLORS["console_bg"], fg=COLORS["console_text"],
+            font=("Consolas", 9), relief="flat", bd=0,
+            state="disabled", wrap="word", padx=10, pady=8,
+        )
+        sb = ttk.Scrollbar(out_frame, orient="vertical", command=self._out.yview)
+        self._out.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._out.pack(side="left", fill="both", expand=True)
+
+        for tag, color in [
+            ("prompt",  COLORS["console_prompt"]),
+            ("ok",      COLORS["console_ok"]),
+            ("error",   COLORS["console_err"]),
+            ("warn",    COLORS["console_warn"]),
+            ("info",    COLORS["console_text"]),
+            ("muted",   COLORS["console_info"]),
+            ("header",  COLORS["accent"]),
+            ("ascii",   "#7a9fff"),
+        ]:
+            self._out.tag_configure(tag, foreground=color)
+        self._out.tag_configure("header", foreground=COLORS["accent"],
+                                font=("Consolas", 10, "bold"))
+        self._out.tag_configure("ascii", foreground="#5588ff",
+                                font=("Consolas", 8))
+
+        # Input row
+        in_frame = tk.Frame(self._cli_frame,
+                            bg=COLORS["surface"], pady=6, padx=10)
+        in_frame.pack(fill="x", padx=10, pady=(4, 8))
+
+        tk.Label(in_frame, text="pkg❯",
+                 font=("Consolas", 10, "bold"),
+                 bg=COLORS["surface"], fg="#a855f7").pack(side="left", padx=(0, 6))
+
+        self._inp_var = tk.StringVar()
+        self._inp = tk.Entry(
+            in_frame, textvariable=self._inp_var,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            font=("Consolas", 10), relief="flat", bd=0,
+            insertbackground=COLORS["accent"],
+        )
+        self._inp.pack(side="left", fill="x", expand=True, ipady=4)
+        self._inp.bind("<Return>",     self._on_enter)
+        self._inp.bind("<Up>",         self._hist_up)
+        self._inp.bind("<Down>",       self._hist_down)
+        self._inp.bind("<Tab>",        self._autocomplete_tab)
+        self._inp.bind("<KeyRelease>", self._on_keyrelease)
+        self._inp.bind("<FocusOut>",   self._hide_ac)
+        self._inp.bind("<Escape>",     self._hide_ac)
+        self._inp.focus_set()
+
+        tk.Button(
+            in_frame, text="Ejecutar",
+            command=lambda: self._on_enter(None),
+            bg="#a855f7", fg="#ffffff",
+            font=FONTS["button"], relief="flat", cursor="hand2",
+            padx=12, pady=4, activebackground="#9333ea",
+        ).pack(side="right")
+
+        # GUI mode frame (hidden until run-ui)
+        self._gui_frame = tk.Frame(self, bg=COLORS["bg"])
+
+        self._print_welcome()
+
+    # ── Welcome ───────────────────────────────────────────────────────────
+
+    def _print_welcome(self):
+        for line in FYRE_MANAGER_ASCII.splitlines():
+            self._write(line, "ascii")
+        self._write("", "info")
+        self._write(FYRE_MANAGER_WELCOME.strip(), "muted")
+        self._write("─" * 62, "muted")
+        count = len(_PLUGINS)
+        if count:
+            self._write(f"  ✅ {count} paquete(s) cargado(s) al inicio.", "ok")
+        else:
+            self._write("  ℹ️  No hay paquetes instalados. Usa 'import' para añadir uno.", "muted")
+        self._write("", "info")
+
+    # ── Output helpers ────────────────────────────────────────────────────
+
+    def _write(self, text: str, tag: str = "info"):
+        self._out.configure(state="normal")
+        self._out.insert("end", text + "\n", tag)
+        self._out.configure(state="disabled")
+        self._out.see("end")
+
+    def _clear_out(self):
+        self._out.configure(state="normal")
+        self._out.delete("1.0", "end")
+        self._out.configure(state="disabled")
+
+    # ── Command dispatch ──────────────────────────────────────────────────
+
+    def _on_enter(self, event):
+        cmd = self._inp_var.get().strip()
+        if not cmd:
+            return
+        self._hide_ac()
+        self._inp_var.set("")
+        self._history.insert(0, cmd)
+        self._hist_idx = -1
+        self._write(f"\npkg❯ {cmd}", "prompt")
+        threading.Thread(target=self._dispatch, args=(cmd,), daemon=True).start()
+
+    def _dispatch(self, raw: str):
+        parts = raw.strip().split()
+        cmd   = parts[0].lower()
+
+        if cmd == "clear":
+            self.after(0, self._clear_out)
+            return
+
+        if cmd == "help":
+            self.after(0, lambda: self._write(FYRE_MANAGER_WELCOME.strip(), "muted"))
+            return
+
+        if cmd == "ls":
+            self.after(0, self._cmd_ls)
+            return
+
+        if cmd == "import":
+            self.after(0, self._cmd_import)
+            return
+
+        if cmd == "delete":
+            name = parts[1] if len(parts) > 1 else None
+            self.after(0, lambda n=name: self._cmd_delete(n))
+            return
+
+        if cmd == "info":
+            name = parts[1] if len(parts) > 1 else None
+            self.after(0, lambda n=name: self._cmd_info(n))
+            return
+
+        if cmd == "reload":
+            self.after(0, self._cmd_reload)
+            return
+
+        if cmd == "run":
+            name = parts[1] if len(parts) > 1 else None
+            self.after(0, lambda n=name: self._cmd_run(n))
+            return
+
+        if cmd == "run-ui":
+            self.after(0, self._show_gui)
+            return
+
+        self.after(0, lambda: self._write(
+            f"Comando desconocido: '{cmd}'. Escribe 'help' para ver la lista.", "warn"))
+
+    # ── ls ────────────────────────────────────────────────────────────────
+
+    def _cmd_ls(self):
+        protected = {"fyrewall.py", "fyremanager.py"}
+        try:
+            files = sorted([
+                f for f in os.listdir(APP_DIR)
+                if f.lower().endswith(".py") and f.lower() not in protected
+            ])
+        except Exception as e:
+            self._write(f"❌ Error leyendo directorio: {e}", "error")
+            return
+
+        if not files:
+            self._write("ℹ️  No hay paquetes .py en el directorio.", "muted")
+            return
+
+        self._write(f"\n📦  Paquetes en {APP_DIR}:", "header")
+        self._write("─" * 54, "muted")
+        for f in files:
+            loaded = f in _PLUGINS
+            has_manifest = loaded
+            if not loaded:
+                # Quick check without full load
+                try:
+                    txt = open(os.path.join(APP_DIR, f), encoding="utf-8", errors="replace").read(2000)
+                    has_manifest = "FYRE_MANIFEST" in txt
+                except Exception:
+                    has_manifest = False
+            status = "✅ cargado" if loaded else ("⚠️  manifest detectado" if has_manifest else "📄 sin manifest")
+            self._write(f"  {'📦' if has_manifest else '📄'}  {f:<35s}  {status}", "info")
+
+        self._write(f"\n  Total: {len(files)} archivo(s)", "muted")
+
+    # ── import ────────────────────────────────────────────────────────────
+
+    def _cmd_import(self):
+        path = filedialog.askopenfilename(
+            parent=self._app,
+            title="Selecciona un paquete FyreWall (.py)",
+            filetypes=[("Python scripts", "*.py"), ("Todos", "*.*")],
+        )
+        if not path:
+            self._write("ℹ️  Importación cancelada.", "muted")
+            return
+
+        fname = os.path.basename(path)
+        dest  = os.path.join(APP_DIR, fname)
+        protected = {"fyrewall.py", "fyremanager.py"}
+        if fname.lower() in protected:
+            self._write(f"❌  No puedes sobrescribir el archivo protegido: {fname}", "error")
+            return
+
+        if os.path.exists(dest) and dest != path:
+            if not messagebox.askyesno(
+                "Sobrescribir",
+                f"Ya existe '{fname}' en el directorio.\n¿Sobrescribir?",
+                parent=self._app
+            ):
+                self._write("ℹ️  Importación cancelada.", "muted")
+                return
+
+        try:
+            if os.path.abspath(path) != os.path.abspath(dest):
+                import shutil
+                shutil.copy2(path, dest)
+            self._write(f"  📥  Copiado: {fname}", "ok")
+        except Exception as e:
+            self._write(f"❌  Error al copiar: {e}", "error")
+            return
+
+        ok, err, manifest = _load_plugin(dest)
+        if ok:
+            cmds = manifest.get("commands", [])
+            self._write(f"  ✅  Paquete '{fname}' cargado correctamente.", "ok")
+            self._write(f"  ℹ️   Comandos registrados: {', '.join(c['name'] for c in cmds) or 'ninguno'}", "muted")
+            # Refresh autocomplete in main terminal
+            self._refresh_main_commands()
+        else:
+            self._write(f"  ⚠️  Archivo copiado pero no cargable como paquete:\n  {err}", "warn")
+
+    # ── delete ────────────────────────────────────────────────────────────
+
+    def _cmd_delete(self, name: str | None):
+        if not name:
+            self._write("Uso: delete <nombre.py>", "warn")
+            return
+        if not name.lower().endswith(".py"):
+            name += ".py"
+        protected = {"fyrewall.py", "fyremanager.py"}
+        if name.lower() in protected:
+            self._write(f"❌  No puedes eliminar el archivo protegido: {name}", "error")
+            return
+        dest = os.path.join(APP_DIR, name)
+        if not os.path.exists(dest):
+            self._write(f"❌  Paquete no encontrado: {name}", "error")
+            return
+        if not messagebox.askyesno(
+            "Eliminar paquete",
+            f"¿Eliminar '{name}' del directorio?\nEsta acción no se puede deshacer.",
+            parent=self._app,
+        ):
+            self._write("ℹ️  Eliminación cancelada.", "muted")
+            return
+        try:
+            os.remove(dest)
+        except Exception as e:
+            self._write(f"❌  Error al eliminar: {e}", "error")
+            return
+        if name in _PLUGINS:
+            del _PLUGINS[name]
+            self._refresh_main_commands()
+        self._write(f"  🗑️   Paquete '{name}' eliminado.", "ok")
+
+    # ── info ──────────────────────────────────────────────────────────────
+
+    def _cmd_info(self, name: str | None):
+        if not name:
+            self._write("Uso: info <nombre.py>", "warn")
+            return
+        if not name.lower().endswith(".py"):
+            name += ".py"
+        entry = _PLUGINS.get(name)
+        if not entry:
+            self._write(f"ℹ️  '{name}' no está cargado (usa 'reload' si lo acabas de copiar).", "muted")
+            return
+        m = entry["manifest"]
+        self._write(f"\n📦  {name}", "header")
+        self._write(f"  Versión:  {m.get('version', '—')}", "info")
+        self._write(f"  Autor:    {m.get('author', '—')}", "info")
+        self._write(f"  Desc.:    {m.get('description', '—')}", "info")
+        cmds = m.get("commands", [])
+        if cmds:
+            self._write("  Comandos:", "info")
+            for c in cmds:
+                kind = c.get("kind", "inline")
+                self._write(
+                    f"    ❯  {c['name']:<20s}  [{kind}]  {c.get('description','')}", "muted")
+        else:
+            self._write("  Sin comandos registrados.", "muted")
+
+    # ── reload ────────────────────────────────────────────────────────────
+
+    def _cmd_reload(self):
+        _PLUGINS.clear()
+        _load_all_plugins()
+        self._refresh_main_commands()
+        count = len(_PLUGINS)
+        self._write(f"  ♻️   {count} paquete(s) recargado(s).", "ok")
+
+    # ── run ───────────────────────────────────────────────────────────────
+
+    def _cmd_run(self, name: str | None):
+        """Launch an extra package: run its main() if defined, else subprocess."""
+        if not name:
+            self._write("Uso: run <nombre.py>", "warn")
+            self._write("     Ejecuta el paquete extra especificado.", "muted")
+            return
+        if not name.lower().endswith(".py"):
+            name += ".py"
+
+        # If already loaded as a FyreWall plugin, call its main() or open tab
+        entry = _PLUGINS.get(name)
+        if entry:
+            mod = entry["module"]
+            manifest = entry["manifest"]
+            # Try calling main() if available
+            if callable(getattr(mod, "main", None)):
+                self._write(f"  ▶  Ejecutando main() de '{name}'...", "ok")
+                def _run_main():
+                    try:
+                        mod.main()
+                    except Exception as e:
+                        self.after(0, lambda err=e: self._write(f"❌ Error en main(): {err}", "error"))
+                threading.Thread(target=_run_main, daemon=True).start()
+                return
+            # Try the first tab command if no main()
+            for cmd_def in manifest.get("commands", []):
+                if cmd_def.get("kind") == "tab" and cmd_def.get("tab_builder"):
+                    cmd_name = cmd_def["name"]
+                    self._write(f"  ▶  Abriendo pestaña '{cmd_name}' de '{name}'...", "ok")
+                    self.after(0, lambda fn=name, cn=cmd_name: self._app._open_plugin_tab(fn, cn))
+                    return
+            # No main() and no tab — just report manifest info
+            desc = manifest.get("description", "Sin descripción")
+            self._write(f"  ℹ️  '{name}' cargado pero sin main() ni tab_builder.", "warn")
+            self._write(f"       Descripción: {desc}", "muted")
+            return
+
+        # Not a FyreWall plugin — try to run as plain Python script via subprocess
+        path = os.path.join(APP_DIR, name)
+        if not os.path.exists(path):
+            self._write(f"❌  Paquete no encontrado: {name}", "error")
+            self._write("   Usa 'ls' para ver los paquetes disponibles.", "muted")
+            return
+
+        self._write(f"  ▶  Lanzando '{name}' como proceso externo...", "ok")
+        def _launch():
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, path],
+                    creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+                )
+                self.after(0, lambda pid=proc.pid: self._write(
+                    f"  ✅  '{name}' iniciado (PID {pid}).", "ok"))
+            except Exception as e:
+                self.after(0, lambda err=e: self._write(f"❌  Error al lanzar '{name}': {err}", "error"))
+        threading.Thread(target=_launch, daemon=True).start()
+
+    # ── Autocomplete ──────────────────────────────────────────────────────
+
+    def _get_pkg_files(self) -> list:
+        """Return sorted list of extra .py files in APP_DIR (excluding protected)."""
+        protected = {"fyrewall.py", "fyremanager.py"}
+        try:
+            return sorted([
+                f for f in os.listdir(APP_DIR)
+                if f.lower().endswith(".py") and f.lower() not in protected
+            ])
+        except Exception:
+            return []
+
+    def _file_ac_matches(self, prefix: str) -> list:
+        """Return (filename, description) pairs whose name starts with prefix."""
+        matches = []
+        for f in self._get_pkg_files():
+            if f.lower().startswith(prefix.lower()):
+                loaded = f in _PLUGINS
+                desc = _PLUGINS[f]["manifest"].get("description", "") if loaded else ""
+                status = "✅ cargado" if loaded else "📄 sin manifest"
+                matches.append((f, f"{status}  {desc}".strip()))
+        return matches
+
+    def _on_keyrelease(self, event):
+        if event.keysym in ("Return", "Tab", "Escape", "Up", "Down"):
+            return
+        current = self._inp_var.get()
+        if not current:
+            self._hide_ac()
+            return
+
+        # ── Autocompletado de archivo tras "run " / "delete " / "info " ──
+        for prefix_cmd in ("run ", "delete ", "info "):
+            if current.lower().startswith(prefix_cmd):
+                file_prefix = current[len(prefix_cmd):]
+                file_matches = self._file_ac_matches(file_prefix)
+                if not file_matches:
+                    self._hide_ac()
+                elif len(file_matches) == 1 and file_matches[0][0] == file_prefix:
+                    self._hide_ac()
+                else:
+                    display = [(prefix_cmd.strip() + " " + f, d) for f, d in file_matches]
+                    self._show_ac(display)
+                return
+
+        # ── Autocompletado de comandos base ──────────────────────────────
+        matches = [(cmd, desc) for cmd, desc in self.FM_COMMANDS
+                   if cmd.strip().startswith(current.lower())]
+        if not matches or (len(matches) == 1 and matches[0][0].strip() == current.lower()):
+            self._hide_ac()
+            return
+        self._show_ac(matches)
+
+    def _show_ac(self, matches):
+        self._hide_ac()
+        popup = tk.Toplevel(self)
+        popup.wm_overrideredirect(True)
+        popup.configure(bg=COLORS["border"])
+        self._autocomplete_popup = popup
+
+        x = self._inp.winfo_rootx()
+        y = self._inp.winfo_rooty() - (len(matches) * 26 + 8)
+        popup.geometry(f"+{x}+{y}")
+
+        for cmd, desc in matches:
+            row = tk.Frame(popup, bg=COLORS["surface2"], pady=1)
+            row.pack(fill="x", padx=1)
+            tk.Label(row, text=f"  {cmd.strip():<20s}", font=("Consolas", 9),
+                     bg=COLORS["surface2"], fg=COLORS["accent"],
+                     cursor="hand2", padx=4).pack(side="left")
+            tk.Label(row, text=desc, font=FONTS["small"],
+                     bg=COLORS["surface2"], fg=COLORS["text_muted"],
+                     cursor="hand2").pack(side="left")
+
+            def on_enter(e, f=row):  f.config(bg=COLORS["btn_hover"]); [w.config(bg=COLORS["btn_hover"]) for w in f.winfo_children()]
+            def on_leave(e, f=row):  f.config(bg=COLORS["surface2"]);  [w.config(bg=COLORS["surface2"]) for w in f.winfo_children()]
+            def on_click(e, c=cmd): self._inp_var.set(c.strip()); self._inp.icursor("end"); self._hide_ac()
+            row.bind("<Enter>", on_enter); row.bind("<Leave>", on_leave); row.bind("<Button-1>", on_click)
+            for w in row.winfo_children():
+                w.bind("<Enter>", on_enter); w.bind("<Leave>", on_leave); w.bind("<Button-1>", on_click)
+        popup.lift()
+
+    def _hide_ac(self, event=None):
+        if self._autocomplete_popup and self._autocomplete_popup.winfo_exists():
+            self._autocomplete_popup.destroy()
+            self._autocomplete_popup = None
+
+    def _autocomplete_tab(self, event):
+        current = self._inp_var.get()
+
+        # ── Tab-complete de archivo tras "run " / "delete " / "info " ────
+        for prefix_cmd in ("run ", "delete ", "info "):
+            if current.lower().startswith(prefix_cmd):
+                file_prefix = current[len(prefix_cmd):]
+                file_matches = [f for f, _ in self._file_ac_matches(file_prefix)]
+                if len(file_matches) == 1:
+                    self._inp_var.set(prefix_cmd.strip() + " " + file_matches[0])
+                    self._inp.icursor("end")
+                elif len(file_matches) > 1:
+                    # Complete to longest common prefix
+                    common = file_matches[0]
+                    for m in file_matches[1:]:
+                        while not m.startswith(common):
+                            common = common[:-1]
+                    if len(common) > len(file_prefix):
+                        self._inp_var.set(prefix_cmd.strip() + " " + common)
+                        self._inp.icursor("end")
+                self._hide_ac()
+                return "break"
+
+        # ── Tab-complete de comandos base ─────────────────────────────────
+        matches = [cmd for cmd, _ in self.FM_COMMANDS if cmd.strip().startswith(current)]
+        if len(matches) == 1:
+            self._inp_var.set(matches[0].strip())
+            self._inp.icursor("end")
+        elif len(matches) > 1:
+            common = matches[0]
+            for m in matches[1:]:
+                while not m.startswith(common):
+                    common = common[:-1]
+            if len(common) > len(current):
+                self._inp_var.set(common.strip())
+                self._inp.icursor("end")
+        self._hide_ac()
+        return "break"
+
+    def _hist_up(self, event):
+        if self._hist_idx < len(self._history) - 1:
+            self._hist_idx += 1
+            self._inp_var.set(self._history[self._hist_idx])
+            self._inp.icursor("end")
+
+    def _hist_down(self, event):
+        if self._hist_idx > 0:
+            self._hist_idx -= 1
+            self._inp_var.set(self._history[self._hist_idx])
+        else:
+            self._hist_idx = -1
+            self._inp_var.set("")
+        self._inp.icursor("end")
+
+    # ── GUI mode (run-ui) ─────────────────────────────────────────────────
+
+    def _show_gui(self):
+        self._ui_mode = True
+        self._cli_frame.pack_forget()
+        for w in self._gui_frame.winfo_children():
+            w.destroy()
+        self._build_gui()
+        self._gui_frame.pack(fill="both", expand=True)
+
+    def _back_to_cli(self):
+        self._ui_mode = False
+        self._gui_frame.pack_forget()
+        self._cli_frame.pack(fill="both", expand=True)
+        self._inp.focus_set()
+
+    def _build_gui(self):
+        f = self._gui_frame
+
+        # Title
+        th = tk.Frame(f, bg=COLORS["surface"], pady=10, padx=16)
+        th.pack(fill="x")
+        tk.Label(th, text="📦  FyreManager — Interfaz Gráfica",
+                 font=FONTS["title"],
+                 bg=COLORS["surface"], fg=COLORS["accent"]).pack(side="left")
+
+        # Main content
+        body = tk.Frame(f, bg=COLORS["bg"])
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+
+        # Action buttons row
+        btn_row = tk.Frame(body, bg=COLORS["bg"])
+        btn_row.pack(fill="x", pady=(0, 20))
+
+        def big_btn(parent, text, icon, color, hover, cmd):
+            b = tk.Frame(parent, bg=color, cursor="hand2")
+            b.pack(side="left", padx=(0, 12), ipadx=4, ipady=8, fill="y")
+            tk.Label(b, text=icon, font=("Segoe UI", 22),
+                     bg=color, fg="#ffffff").pack(padx=20, pady=(8, 2))
+            tk.Label(b, text=text, font=("Segoe UI", 9, "bold"),
+                     bg=color, fg="#ffffff").pack(padx=20, pady=(0, 8))
+            for w in [b] + b.winfo_children():
+                w.bind("<Button-1>", lambda e, c=cmd: c())
+                w.bind("<Enter>",  lambda e, fr=b, hov=hover: fr.config(bg=hov) or [x.config(bg=hov) for x in fr.winfo_children()])
+                w.bind("<Leave>",  lambda e, fr=b, col=color: fr.config(bg=col) or [x.config(bg=col) for x in fr.winfo_children()])
+            return b
+
+        big_btn(btn_row, "Importar paquete", "📥", "#2a5090", "#3a60a0", self._cmd_import)
+        big_btn(btn_row, "Eliminar paquete", "🗑️", "#5a1818", "#7a2020", self._gui_delete)
+        big_btn(btn_row, "Recargar todo",    "♻️", "#1a4a2a", "#2a6a3a", lambda: (self._cmd_reload(), self._show_gui()))
+
+        # Packages list
+        list_hdr = tk.Frame(body, bg=COLORS["surface"], pady=6, padx=12)
+        list_hdr.pack(fill="x")
+        tk.Label(list_hdr, text="PAQUETES INSTALADOS",
+                 font=FONTS["label"],
+                 bg=COLORS["surface"], fg=COLORS["accent"]).pack(side="left")
+        self._gui_count_lbl = tk.Label(list_hdr, text="",
+                                       font=FONTS["small"],
+                                       bg=COLORS["surface"], fg=COLORS["text_muted"])
+        self._gui_count_lbl.pack(side="right")
+
+        list_outer = tk.Frame(body, bg=COLORS["console_bg"])
+        list_outer.pack(fill="both", expand=True, pady=(0, 12))
+
+        self._gui_list = tk.Frame(list_outer, bg=COLORS["console_bg"])
+        self._gui_list.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self._populate_gui_list()
+
+        # Back button
+        tk.Button(
+            body, text="← Volver a la CLI",
+            command=self._back_to_cli,
+            bg=COLORS["surface2"], fg=COLORS["text_muted"],
+            font=("Segoe UI", 8), relief="flat", cursor="hand2",
+            padx=10, pady=4, activebackground=COLORS["btn_hover"],
+        ).pack(anchor="w")
+
+    def _populate_gui_list(self):
+        for w in self._gui_list.winfo_children():
+            w.destroy()
+        protected = {"fyrewall.py", "fyremanager.py"}
+        try:
+            files = sorted([
+                f for f in os.listdir(APP_DIR)
+                if f.lower().endswith(".py") and f.lower() not in protected
+            ])
+        except Exception:
+            files = []
+
+        if not files:
+            tk.Label(self._gui_list,
+                     text="No hay paquetes instalados. Usa 'Importar paquete' para añadir uno.",
+                     font=FONTS["body"], bg=COLORS["console_bg"], fg=COLORS["text_muted"],
+                     pady=20).pack()
+            self._gui_count_lbl.config(text="0 paquetes")
+            return
+
+        self._gui_count_lbl.config(text=f"{len(files)} paquete(s)")
+
+        for fname in files:
+            loaded = fname in _PLUGINS
+            row = tk.Frame(self._gui_list, bg=COLORS["surface"], pady=6, padx=10)
+            row.pack(fill="x", pady=(0, 4))
+
+            icon_txt = "📦" if loaded else "📄"
+            tk.Label(row, text=icon_txt, font=("Segoe UI", 16),
+                     bg=COLORS["surface"], fg=COLORS["text"]).pack(side="left", padx=(0, 8))
+
+            info_col = tk.Frame(row, bg=COLORS["surface"])
+            info_col.pack(side="left", fill="x", expand=True)
+            tk.Label(info_col, text=fname,
+                     font=("Segoe UI", 9, "bold"),
+                     bg=COLORS["surface"], fg=COLORS["text"]).pack(anchor="w")
+
+            if loaded:
+                m = _PLUGINS[fname]["manifest"]
+                cmds_str = ", ".join(c["name"] for c in m.get("commands", []))
+                desc = m.get("description", "Sin descripción")
+                tk.Label(info_col, text=f"{desc}  •  cmds: {cmds_str or '—'}",
+                         font=FONTS["small"],
+                         bg=COLORS["surface"], fg=COLORS["text_muted"]).pack(anchor="w")
+            else:
+                tk.Label(info_col, text="Sin FYRE_MANIFEST — no es un paquete FyreWall",
+                         font=FONTS["small"],
+                         bg=COLORS["surface"], fg=COLORS["text_muted"]).pack(anchor="w")
+
+            # ── Play button ──────────────────────────────────────────────
+            tk.Button(
+                row, text="▶ Ejecutar",
+                command=lambda n=fname: self._cmd_run(n),
+                bg=COLORS["green_btn"], fg="#ffffff",
+                font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2",
+                padx=6, pady=2, activebackground=COLORS["green_active"],
+            ).pack(side="right", padx=(4, 0))
+
+            tk.Button(
+                row, text="🗑 Eliminar",
+                command=lambda n=fname: (self._cmd_delete(n), self._populate_gui_list()),
+                bg=COLORS["red_btn"], fg="#ffffff",
+                font=("Segoe UI", 8), relief="flat", cursor="hand2",
+                padx=6, pady=2, activebackground=COLORS["red_active"],
+            ).pack(side="right", padx=(8, 0))
+
+            # ── Double-click to run ──────────────────────────────────────
+            def _on_dblclick(e, n=fname):
+                self._back_to_cli()
+                self._cmd_run(n)
+
+            for widget in [row] + row.winfo_children() + info_col.winfo_children():
+                widget.bind("<Double-Button-1>", _on_dblclick)
+
+    def _gui_delete(self):
+        """Open a window listing packages for deletion."""
+        win = tk.Toplevel(self._app)
+        win.title("Eliminar paquete — FyreManager")
+        win.configure(bg=COLORS["bg"])
+        win.geometry("500x400")
+        win.resizable(False, True)
+
+        tk.Label(win, text="Selecciona el paquete a eliminar:",
+                 font=FONTS["body"],
+                 bg=COLORS["bg"], fg=COLORS["text"],
+                 pady=12).pack()
+
+        protected = {"fyrewall.py", "fyremanager.py"}
+        try:
+            files = sorted([
+                f for f in os.listdir(APP_DIR)
+                if f.lower().endswith(".py") and f.lower() not in protected
+            ])
+        except Exception:
+            files = []
+
+        if not files:
+            tk.Label(win, text="No hay paquetes para eliminar.",
+                     font=FONTS["body"],
+                     bg=COLORS["bg"], fg=COLORS["text_muted"]).pack(pady=20)
+            tk.Button(win, text="Cerrar", command=win.destroy,
+                      bg=COLORS["btn"], fg=COLORS["text"],
+                      font=FONTS["button"], relief="flat", padx=12, pady=4).pack()
+            return
+
+        frame = tk.Frame(win, bg=COLORS["bg"])
+        frame.pack(fill="both", expand=True, padx=12, pady=4)
+
+        for fname in files:
+            row = tk.Frame(frame, bg=COLORS["surface"], pady=5, padx=10)
+            row.pack(fill="x", pady=(0, 3))
+            tk.Label(row, text=fname, font=("Consolas", 9),
+                     bg=COLORS["surface"], fg=COLORS["text"]).pack(side="left")
+            tk.Button(
+                row, text="🗑 Eliminar",
+                command=lambda n=fname, w=win: (self._cmd_delete(n), self._populate_gui_list(), w.destroy()),
+                bg=COLORS["red_btn"], fg="#ffffff",
+                font=("Segoe UI", 8), relief="flat", cursor="hand2",
+                padx=6, pady=2, activebackground=COLORS["red_active"],
+            ).pack(side="right")
+
+        tk.Button(win, text="Cancelar", command=win.destroy,
+                  bg=COLORS["surface2"], fg=COLORS["text_muted"],
+                  font=("Segoe UI", 8), relief="flat", padx=10, pady=3).pack(pady=8)
+
+    # ── Refresh main terminal autocomplete ────────────────────────────────
+
+    def _refresh_main_commands(self):
+        """Tell the main app to refresh its command list with plugin commands."""
+        try:
+            plugin_cmds = _get_plugin_commands_for_autocomplete()
+            # Merge into global COMMANDS (avoid duplicates)
+            existing = {c for c, _ in COMMANDS}
+            for name, desc in plugin_cmds:
+                if name not in existing:
+                    COMMANDS.append((name, desc))
+                    existing.add(name)
+        except Exception:
+            pass
 
 
 # ─── ENTRY POINT ──────────────────────────────────────────────────────────────
