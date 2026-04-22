@@ -342,49 +342,33 @@ def _run(args: list[str]) -> tuple[bool, str]:
         return False, str(e)
 
 
-def cmd_block_port(port: int, proto: str = "TCP", direction: str = "both") -> tuple[bool, str, str]:
-    """
-    Bloquea un puerto en el Firewall de Windows (netsh advfirewall).
-    - direction="both"  → crea reglas IN y OUT (por defecto)
-    - direction="in"    → solo entrante
-    - direction="out"   → solo saliente
-    Las reglas son persistentes: sobreviven al cierre de la app y a reinicios.
-    """
-    directions = ["in", "out"] if direction == "both" else [direction]
-    last_name = ""
-    all_ok = True
-    msgs = []
-    for d in directions:
-        name = f"{RULE_PREFIX}Block_{proto.upper()}_{d.upper()}_{port}"
-        last_name = name
-        ok, msg = _run([
-            "netsh", "advfirewall", "firewall", "add", "rule",
-            f"name={name}", f"protocol={proto.upper()}", f"dir={d}",
-            f"localport={port}", "action=block", "enable=yes",
-            "profile=any",
-        ])
-        if not ok:
-            all_ok = False
-            msgs.append(msg)
-    return all_ok, ("; ".join(msgs) if msgs else ""), last_name
+def _rule_exists(rule_name: str) -> bool:
+    """Check if a firewall rule with this exact name already exists."""
+    ok, out = _run([
+        "netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}",
+    ])
+    return ok and "No rules match" not in out and rule_name in out
 
 
-def cmd_unblock_port(port: int, proto: str = "TCP", direction: str = "both") -> tuple[bool, str]:
-    """Elimina todas las reglas FyreWall para ese puerto/protocolo."""
-    directions = ["in", "out"] if direction == "both" else [direction]
-    all_ok = True
-    msgs = []
-    for d in directions:
-        name = f"{RULE_PREFIX}Block_{proto.upper()}_{d.upper()}_{port}"
-        ok, msg = _run([
-            "netsh", "advfirewall", "firewall", "delete", "rule",
-            f"name={name}",
-        ])
-        # "No hay reglas que coincidan" no es un error real al desbloquear
-        if not ok and "no rules match" not in msg.lower() and "no hay reglas" not in msg.lower():
-            all_ok = False
-            msgs.append(msg)
-    return all_ok, ("; ".join(msgs) if msgs else "")
+def cmd_block_port(port: int, proto: str = "TCP", direction: str = "in") -> tuple[bool, str, str]:
+    name = f"{RULE_PREFIX}Block_{proto}_{direction.upper()}_{port}"
+    if _rule_exists(name):
+        return True, "ya existe", name
+    ok, msg = _run([
+        "netsh", "advfirewall", "firewall", "add", "rule",
+        f"name={name}", f"protocol={proto.upper()}", f"dir={direction}",
+        f"localport={port}", "action=block",
+    ])
+    return ok, msg, name
+
+
+def cmd_unblock_port(port: int, proto: str = "TCP", direction: str = "in") -> tuple[bool, str]:
+    name = f"{RULE_PREFIX}Block_{proto}_{direction.upper()}_{port}"
+    ok, msg = _run([
+        "netsh", "advfirewall", "firewall", "delete", "rule",
+        f"name={name}",
+    ])
+    return ok, msg
 
 
 def cmd_block_app(path: str) -> tuple[bool, str]:
@@ -392,206 +376,61 @@ def cmd_block_app(path: str) -> tuple[bool, str]:
     ok, msg = _run([
         "netsh", "advfirewall", "firewall", "add", "rule",
         f"name={name}", "dir=out", "action=block",
-        f"program={path}", "enable=yes", "profile=any",
+        f"program={path}", "enable=yes",
     ])
     return ok, msg
 
 
 def cmd_list_rules() -> dict:
-    """
-    Lista todas las reglas FyreWall activas en el Firewall de Windows.
-    Usa PowerShell Get-NetFirewallRule (más fiable) con fallback a netsh.
-    Retorna un dict ordenado con puertos, IPs y reglas de app bloqueadas.
-    """
-    # ── Método 1: PowerShell (más fiable, da output estructurado) ────────
-    ps = (
-        "Get-NetFirewallRule -DisplayName 'FyreWall_*' -ErrorAction SilentlyContinue | "
-        "ForEach-Object { "
-        "  $r = $_; "
-        "  $pf = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue; "
-        "  $af = $r | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue; "
-        "  $appf = $r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue; "
-        "  [PSCustomObject]@{ "
-        "    Name=$r.DisplayName; "
-        "    Dir=$r.Direction; "
-        "    Action=$r.Action; "
-        "    Enabled=$r.Enabled; "
-        "    Proto=if($pf){$pf.Protocol}else{'Any'}; "
-        "    LocalPort=if($pf -and $pf.LocalPort -ne 'Any'){$pf.LocalPort}else{''}; "
-        "    RemoteAddr=if($af -and $af.RemoteAddress -ne 'Any'){$af.RemoteAddress}else{''}; "
-        "    Program=if($appf -and $appf.Program -ne 'Any'){$appf.Program}else{''}; "
-        "  } "
-        "} | ConvertTo-Json -Compress"
-    )
-    ok, out = _run(["powershell", "-WindowStyle", "Hidden", "-Command", ps])
-
-    results = {}
-
-    if ok and out.strip() and out.strip() not in ("null", "[]"):
-        import json
-        try:
-            raw = out.strip()
-            # PowerShell returns object (not array) when only 1 result
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                data = [data]
-
-            for r in data:
-                name     = r.get("Name", "")
-                direction= str(r.get("Dir", "")).strip()
-                action   = str(r.get("Action", "")).strip()
-                enabled  = str(r.get("Enabled", "True")).strip()
-                proto    = str(r.get("Proto", "Any")).strip()
-                port     = str(r.get("LocalPort", "")).strip()
-                remote   = str(r.get("RemoteAddr", "")).strip()
-                program  = str(r.get("Program", "")).strip()
-
-                # Normalize direction from PowerShell enum names
-                dir_map = {"Inbound": "In", "Outbound": "Out", "In": "In", "Out": "Out"}
-                direction = dir_map.get(direction, direction)
-
-                # Categorize: IP block, port block, or app block
-                if remote and not port:
-                    # IP-based rule
-                    key = f"IP:{remote}"
-                    if key not in results:
-                        results[key] = {
-                            "type": "ip", "name": name, "remote": remote,
-                            "dirs": [], "action": action, "enabled": enabled,
-                            "proto": proto,
-                        }
-                    if direction and direction not in results[key]["dirs"]:
-                        results[key]["dirs"].append(direction)
-                elif program:
-                    key = f"APP:{program}"
-                    if key not in results:
-                        results[key] = {
-                            "type": "app", "name": name, "program": program,
-                            "dirs": [], "action": action, "enabled": enabled,
-                        }
-                    if direction and direction not in results[key]["dirs"]:
-                        results[key]["dirs"].append(direction)
-                elif port:
-                    key = f"PORT:{port}/{proto}"
-                    if key not in results:
-                        results[key] = {
-                            "type": "port", "name": name, "port": port,
-                            "proto": proto, "dirs": [],
-                            "action": action, "enabled": enabled,
-                        }
-                    if direction and direction not in results[key]["dirs"]:
-                        results[key]["dirs"].append(direction)
-                else:
-                    # Generic rule (isolate, etc)
-                    key = f"RULE:{name}"
-                    results[key] = {
-                        "type": "rule", "name": name, "dirs": [direction],
-                        "action": action, "enabled": enabled,
-                    }
-            return results
-        except Exception:
-            pass  # fall through to netsh method
-
-    # ── Método 2: netsh fallback ─────────────────────────────────────────
+    """List all ports/rules blocked by FyreWall."""
+    # netsh wildcard 'name=FyreWall_*' does NOT work — must dump all and filter
     ok, out = _run([
-        "netsh", "advfirewall", "firewall", "show", "rule",
-        f"name={RULE_PREFIX}*",
+        "netsh", "advfirewall", "firewall", "show", "rule", "name=all",
     ])
     if not ok or not out.strip():
         return {}
-    low = out.lower()
-    if "no rules match" in low or "no hay reglas" in low:
-        return {}
 
-    current = {}
+    # Parse into structured port list, keeping only FyreWall_ rules
+    ports_found = {}
+    current_name = None
+    current_proto = None
+    current_port = None
+    current_dir = None
+    current_action = None
 
-    def _flush_netsh(c):
-        name = c.get("name", "")
-        if not name:
-            return
-        port    = c.get("port", "")
-        remote  = c.get("remote", "")
-        program = c.get("program", "")
-        proto   = c.get("proto", "ANY")
-        dir_    = c.get("dir", "")
-        action  = c.get("action", "Block")
-        enabled = c.get("enabled", "Yes")
+    def _flush():
+        nonlocal current_name, current_proto, current_port, current_dir, current_action
+        if current_name and current_name.startswith(RULE_PREFIX):
+            if current_port and current_port not in ("Any", "any", ""):
+                key = f"{current_port}/{current_proto or 'ANY'}"
+                if key not in ports_found:
+                    ports_found[key] = {
+                        "name": current_name,
+                        "port": current_port,
+                        "proto": current_proto or "ANY",
+                        "dirs": [],
+                        "action": current_action or "Block",
+                    }
+                if current_dir and current_dir not in ports_found[key]["dirs"]:
+                    ports_found[key]["dirs"].append(current_dir)
+        current_name = current_proto = current_port = current_dir = current_action = None
 
-        if remote and not port:
-            key = f"IP:{remote}"
-            if key not in results:
-                results[key] = {"type":"ip","name":name,"remote":remote,
-                                "dirs":[],"action":action,"enabled":enabled,"proto":proto}
-            if dir_ and dir_ not in results[key]["dirs"]:
-                results[key]["dirs"].append(dir_)
-        elif program:
-            key = f"APP:{program}"
-            if key not in results:
-                results[key] = {"type":"app","name":name,"program":program,
-                                "dirs":[],"action":action,"enabled":enabled}
-            if dir_ and dir_ not in results[key]["dirs"]:
-                results[key]["dirs"].append(dir_)
-        elif port and port not in ("Any", ""):
-            key = f"PORT:{port}/{proto}"
-            if key not in results:
-                results[key] = {"type":"port","name":name,"port":port,
-                                "proto":proto,"dirs":[],"action":action,"enabled":enabled}
-            if dir_ and dir_ not in results[key]["dirs"]:
-                results[key]["dirs"].append(dir_)
-        else:
-            key = f"RULE:{name}"
-            results[key] = {"type":"rule","name":name,"dirs":[dir_],
-                            "action":action,"enabled":enabled}
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Rule Name:"):
+            _flush()
+            current_name = line.split(":", 1)[1].strip()
+        elif line.startswith("Protocol:"):
+            current_proto = line.split(":", 1)[1].strip()
+        elif line.startswith("LocalPort:") or line.startswith("Local Port:"):
+            current_port = line.split(":", 1)[1].strip()
+        elif line.startswith("Direction:"):
+            current_dir = line.split(":", 1)[1].strip()
+        elif line.startswith("Action:"):
+            current_action = line.split(":", 1)[1].strip()
 
-    FIELD_MAP = {
-        "rule name":        "name",    "nombre de regla":    "name",
-        "protocol":         "proto",   "protocolo":          "proto",
-        "localport":        "port",    "puerto local":       "port",
-        "local port":       "port",
-        "remoteip":         "remote",  "ip remota":          "remote",
-        "remote ip":        "remote",
-        "direction":        "dir",     "dirección":          "dir",   "direccion": "dir",
-        "action":           "action",  "acción":             "action","accion":    "action",
-        "enabled":          "enabled", "habilitado":         "enabled",
-        "program":          "program", "programa":           "program",
-    }
-
-    for line in out.splitlines() + [""]:
-        stripped = line.strip()
-        if not stripped:
-            if current:
-                _flush_netsh(current)
-                current = {}
-            continue
-        if ":" in stripped:
-            raw_key, _, val = stripped.partition(":")
-            mapped = FIELD_MAP.get(raw_key.strip().lower())
-            if mapped:
-                v = val.strip()
-                if mapped == "name":
-                    if current:
-                        _flush_netsh(current)
-                    current = {"name": v}
-                elif v and v.lower() not in ("any", ""):
-                    current[mapped] = v
-
-    if current:
-        _flush_netsh(current)
-
-    return results
-
-
-def is_port_blocked(port: int, proto: str = "TCP", direction: str = "in") -> bool:
-    """Comprueba en tiempo real si el Firewall de Windows tiene una regla activa."""
-    name = f"{RULE_PREFIX}Block_{proto.upper()}_{direction.upper()}_{port}"
-    ok, out = _run([
-        "netsh", "advfirewall", "firewall", "show", "rule",
-        f"name={name}",
-    ])
-    if not ok:
-        return False
-    low = out.lower()
-    return name.lower() in low and "no rules match" not in low and "no hay reglas" not in low
+    _flush()  # flush last rule
+    return ports_found
 
 
 def cmd_flush_all() -> tuple[bool, str]:
@@ -600,138 +439,6 @@ def cmd_flush_all() -> tuple[bool, str]:
         f"name={RULE_PREFIX}*",
     ])
     return ok, msg
-
-
-# ─── IP BLOCKING ──────────────────────────────────────────────────────────────
-
-import ipaddress as _ipaddress
-
-def _sanitize_ip(raw: str) -> str:
-    """Valida y normaliza una IP o rango CIDR. Lanza ValueError si no es válido."""
-    raw = raw.strip()
-    try:
-        # Accept single IP or CIDR range
-        _ipaddress.ip_network(raw, strict=False)
-        return raw
-    except ValueError:
-        raise ValueError(f"'{raw}' no es una IP o rango CIDR válido")
-
-
-def cmd_block_ip(ip: str) -> tuple[bool, str, str]:
-    """
-    Bloquea una IP o rango CIDR en el Firewall de Windows (entrada + salida).
-    Las reglas son persistentes y sobreviven a reinicios.
-    """
-    try:
-        ip = _sanitize_ip(ip)
-    except ValueError as e:
-        return False, str(e), ""
-
-    safe = ip.replace("/", "_").replace(".", "_").replace(":", "_")
-    name_in  = f"{RULE_PREFIX}BlockIP_IN_{safe}"
-    name_out = f"{RULE_PREFIX}BlockIP_OUT_{safe}"
-
-    ok1, m1 = _run([
-        "netsh", "advfirewall", "firewall", "add", "rule",
-        f"name={name_in}", "dir=in", "action=block",
-        "protocol=any", f"remoteip={ip}",
-        "enable=yes", "profile=any",
-    ])
-    ok2, m2 = _run([
-        "netsh", "advfirewall", "firewall", "add", "rule",
-        f"name={name_out}", "dir=out", "action=block",
-        "protocol=any", f"remoteip={ip}",
-        "enable=yes", "profile=any",
-    ])
-    ok = ok1 and ok2
-    msg = "; ".join(m for m in [m1, m2] if m and not ok) if not ok else ""
-    return ok, msg, name_in
-
-
-def cmd_unblock_ip(ip: str) -> tuple[bool, str]:
-    """Elimina las reglas de bloqueo para una IP o rango CIDR."""
-    try:
-        ip = _sanitize_ip(ip)
-    except ValueError as e:
-        return False, str(e)
-
-    safe = ip.replace("/", "_").replace(".", "_").replace(":", "_")
-    msgs = []
-    all_ok = True
-    for suffix in (f"BlockIP_IN_{safe}", f"BlockIP_OUT_{safe}"):
-        name = f"{RULE_PREFIX}{suffix}"
-        ok, msg = _run([
-            "netsh", "advfirewall", "firewall", "delete", "rule",
-            f"name={name}",
-        ])
-        if not ok and "no rules match" not in msg.lower() and "no hay reglas" not in msg.lower():
-            all_ok = False
-            msgs.append(msg)
-    return all_ok, "; ".join(msgs) if msgs else ""
-
-
-def cmd_block_ip_list(file_path: str) -> dict:
-    """
-    Lee un archivo de texto con una IP por línea y bloquea todas.
-    Acepta comentarios (#) y líneas en blanco. Soporta CIDR.
-    Retorna {"ok": [...], "fail": [...], "skip": int}
-    """
-    results = {"ok": [], "fail": [], "skip": 0}
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except Exception as e:
-        results["fail"].append(f"No se pudo abrir el archivo: {e}")
-        return results
-
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            results["skip"] += 1
-            continue
-        ip = line.split("#")[0].strip()
-        if not ip:
-            results["skip"] += 1
-            continue
-        ok, msg, _ = cmd_block_ip(ip)
-        if ok:
-            results["ok"].append(ip)
-        else:
-            results["fail"].append(f"{ip} → {msg}")
-
-    return results
-
-
-def cmd_unblock_ip_list(file_path: str) -> dict:
-    """
-    Lee un archivo de texto con una IP por línea y desbloquea todas.
-    Acepta comentarios (#) y líneas en blanco. Soporta CIDR.
-    Retorna {"ok": [...], "fail": [...], "skip": int}
-    """
-    results = {"ok": [], "fail": [], "skip": 0}
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except Exception as e:
-        results["fail"].append(f"No se pudo abrir el archivo: {e}")
-        return results
-
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            results["skip"] += 1
-            continue
-        ip = line.split("#")[0].strip()
-        if not ip:
-            results["skip"] += 1
-            continue
-        ok, msg = cmd_unblock_ip(ip)
-        if ok:
-            results["ok"].append(ip)
-        else:
-            results["fail"].append(f"{ip} → {msg}")
-
-    return results
 
 
 def cmd_isolate(enable: bool) -> tuple[bool, str]:
@@ -796,215 +503,35 @@ def check_service_status(service_name: str) -> str:
         return "not_found"
 
 
-# Known service names (all versions / variants)
 CLASSROOM_SERVICES = {
     "insight": [
         "FaronicsInsightStudent",
         "InsightConnectionService",
         "FaronicsInsight",
         "InsSvc",
-        "Insight",
-        "FnFSvc",
-        "FaronicsCore",
     ],
     "rebootrestore": [
         "RmServer",
         "RmClientSvc",
         "RebootRestoreRx",
         "RmClient",
-        "FaronicsRebootRestore",
-        "DriveVaccine",
-        "DVAgent",
     ],
 }
-
-# Known process names (exe names without extension)
-CLASSROOM_PROCESSES_DETECT = {
-    "insight": [
-        "InsSvc", "InsStudent", "FnF", "InsConnSvc",
-        "FaronicsInsight", "Insight", "InsightStudent",
-        "FaronicsInsightConsole", "InsTray",
-    ],
-    "rebootrestore": [
-        "RmClient", "RmServer", "RmConsole",
-        "DriveVaccine", "DVClient", "DVServer",
-        "RebootRestoreRx", "FaronicsRR",
-    ],
-}
-
-# Known install paths/registry keys to check
-CLASSROOM_INSTALL_PATHS = {
-    "insight": [
-        r"C:\Program Files (x86)\Faronics\Insight",
-        r"C:\Program Files\Faronics\Insight",
-        r"C:\Program Files (x86)\Insight",
-        r"C:\Program Files\Insight",
-    ],
-    "rebootrestore": [
-        r"C:\Program Files (x86)\Faronics\Faronics Reboot Restore",
-        r"C:\Program Files\Faronics\Faronics Reboot Restore",
-        r"C:\Program Files (x86)\Faronics\Deep Freeze",
-        r"C:\Program Files\Faronics\Deep Freeze",
-        r"C:\Program Files (x86)\Drive Vaccine",
-        r"C:\Program Files\Drive Vaccine",
-    ],
-}
-
-# Known active ports that indicate the software is running
-CLASSROOM_ACTIVE_PORTS = {
-    "insight": [796, 11796, 1053, 8888, 8889, 8890],
-    "rebootrestore": [9000, 9001, 9010, 5900],
-}
-
-
-def _get_running_process_names() -> set:
-    """Returns a set of running process names (lowercase, without .exe)."""
-    names = set()
-    try:
-        # Method 1: tasklist
-        r = subprocess.run(
-            ["tasklist", "/fo", "csv", "/nh"],
-            capture_output=True, text=True, timeout=10, creationflags=CF
-        )
-        for line in r.stdout.splitlines():
-            parts = [p.strip('"') for p in line.split('","')]
-            if parts:
-                names.add(parts[0].lower().replace(".exe", ""))
-    except Exception:
-        pass
-    try:
-        # Method 2: PowerShell Get-Process (catches more hidden processes)
-        r = subprocess.run(
-            ["powershell", "-WindowStyle", "Hidden", "-Command",
-             "Get-Process | Select-Object -ExpandProperty Name"],
-            capture_output=True, text=True, timeout=10, creationflags=CF
-        )
-        for line in r.stdout.splitlines():
-            n = line.strip().lower().replace(".exe", "")
-            if n:
-                names.add(n)
-    except Exception:
-        pass
-    return names
-
-
-def _get_active_local_ports() -> set:
-    """Returns a set of active local port numbers."""
-    ports = set()
-    try:
-        r = subprocess.run(
-            ["netstat", "-ano"],
-            capture_output=True, text=True, timeout=10, creationflags=CF
-        )
-        for line in r.stdout.splitlines():
-            m = re.search(r":(\d+)\s", line)
-            if m:
-                ports.add(int(m.group(1)))
-    except Exception:
-        pass
-    return ports
-
-
-def _check_registry_installed(app_key: str) -> bool:
-    """Check Windows registry for software installation."""
-    ps_queries = {
-        "insight": (
-            "Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* "
-            "2>$null | Where-Object { $_.DisplayName -like '*Insight*' -or $_.DisplayName -like '*Faronics*' } "
-            "| Select-Object -First 1 -ExpandProperty DisplayName"
-        ),
-        "rebootrestore": (
-            "Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* "
-            "2>$null | Where-Object { $_.DisplayName -like '*Reboot Restore*' -or $_.DisplayName -like '*Drive Vaccine*' -or $_.DisplayName -like '*Deep Freeze*' } "
-            "| Select-Object -First 1 -ExpandProperty DisplayName"
-        ),
-    }
-    query = ps_queries.get(app_key, "")
-    if not query:
-        return False
-    try:
-        r = subprocess.run(
-            ["powershell", "-WindowStyle", "Hidden", "-Command", query],
-            capture_output=True, text=True, timeout=8, creationflags=CF
-        )
-        return bool(r.stdout.strip())
-    except Exception:
-        return False
 
 
 def check_classroom_services_status() -> dict:
-    """
-    Detección exhaustiva de Insight y Reboot Restore mediante 4 métodos:
-      1. Servicios de Windows (sc query)
-      2. Procesos en ejecución (tasklist + PowerShell Get-Process)
-      3. Archivos instalados en rutas conocidas
-      4. Puertos de red activos conocidos
-      5. Registro de Windows (instalación)
-    """
+    """Check if Insight and RebootRestore services are running."""
     result = {
-        "insight":       {"status": "not_found", "service": None, "detail": [], "blocked": False},
-        "rebootrestore": {"status": "not_found", "service": None, "detail": [], "blocked": False},
+        "insight": {"status": "not_found", "service": None},
+        "rebootrestore": {"status": "not_found", "service": None},
     }
-
-    running_procs = _get_running_process_names()
-    active_ports  = _get_active_local_ports()
-
-    for app_key in ("insight", "rebootrestore"):
-        found     = False
-        is_running = False
-        detail    = []
-
-        # ── 1. Windows services ──────────────────────────────────────
-        for svc in CLASSROOM_SERVICES[app_key]:
+    for app_key, services in CLASSROOM_SERVICES.items():
+        for svc in services:
             status = check_service_status(svc)
-            if status == "running":
-                is_running = True
-                found = True
+            if status in ("running", "stopped"):
+                result[app_key]["status"] = status
                 result[app_key]["service"] = svc
-                detail.append(f"servicio '{svc}' ACTIVO")
                 break
-            elif status == "stopped":
-                found = True
-                result[app_key]["service"] = svc
-                detail.append(f"servicio '{svc}' detenido")
-
-        # ── 2. Running processes ─────────────────────────────────────
-        for proc in CLASSROOM_PROCESSES_DETECT[app_key]:
-            if proc.lower().replace(".exe", "") in running_procs:
-                is_running = True
-                found = True
-                detail.append(f"proceso '{proc}' en ejecución")
-
-        # ── 3. Install paths ─────────────────────────────────────────
-        for path in CLASSROOM_INSTALL_PATHS[app_key]:
-            if os.path.isdir(path):
-                found = True
-                detail.append(f"instalado en {path}")
-                break
-
-        # ── 4. Active ports ──────────────────────────────────────────
-        for port in CLASSROOM_ACTIVE_PORTS[app_key]:
-            if port in active_ports:
-                is_running = True
-                found = True
-                detail.append(f"puerto {port} activo")
-
-        # ── 5. Registry ──────────────────────────────────────────────
-        if not found:
-            if _check_registry_installed(app_key):
-                found = True
-                detail.append("entrada en registro de Windows")
-
-        # ── Determine final status ───────────────────────────────────
-        if is_running:
-            result[app_key]["status"] = "running"
-        elif found:
-            result[app_key]["status"] = "stopped"
-        else:
-            result[app_key]["status"] = "not_found"
-
-        result[app_key]["detail"] = detail
-
     return result
 
 
@@ -1051,6 +578,8 @@ CLASSROOM_PROCESSES = {
 
 def _block_port_range(port_range: str, proto: str, direction: str, rule_name: str) -> tuple[bool, str]:
     full_name = f"{RULE_PREFIX}{rule_name}"
+    if _rule_exists(full_name):
+        return True, "ya existe"
     ok, msg = _run([
         "netsh", "advfirewall", "firewall", "add", "rule",
         f"name={full_name}", f"protocol={proto.upper()}", f"dir={direction}",
@@ -1061,32 +590,31 @@ def _block_port_range(port_range: str, proto: str, direction: str, rule_name: st
 
 def apply_classroom_block(app_key: str, log_callback=None) -> dict:
     rules = CLASSROOM_RULES.get(app_key, [])
-    results = {"ok": 0, "fail": 0, "messages": []}
+    results = {"ok": 0, "fail": 0, "skipped": 0, "messages": []}
 
     def log(msg):
         results["messages"].append(msg)
         if log_callback:
             log_callback(msg)
 
-    for rule in rules:
-        name = rule["name"]
-        proto = rule["proto"]
-        direction = rule["dir"]
-        full_name = f"{RULE_PREFIX}{name}"
-        if "port_range" in rule:
-            ok, msg = _block_port_range(rule["port_range"], proto, direction, name)
-            label = f"{proto} {rule['port_range']} {direction.upper()}"
-        else:
-            port = rule["port"]
-            ok, msg, _ = cmd_block_port(port, proto, direction)
-            label = f"{proto} {port} {direction.upper()}"
-        if ok:
-            results["ok"] += 1
-            log(f"  ✅ Bloqueado: {label}  →  {full_name}")
-        else:
-            results["fail"] += 1
-            log(f"  ⚠️  Error {label}: {msg[:60]}")
+    # ── 1. Stop & disable services first ─────────────────────────────────
+    log("  🛑 Deteniendo servicios...")
+    found_any_service = False
+    for svc in CLASSROOM_SERVICES.get(app_key, []):
+        status = check_service_status(svc)
+        if status == "running":
+            found_any_service = True
+            _run(["sc", "stop", svc])
+            _run(["sc", "config", svc, "start=", "disabled"])
+            log(f"  🛑 Servicio detenido y deshabilitado: {svc}")
+        elif status == "stopped":
+            found_any_service = True
+            _run(["sc", "config", svc, "start=", "disabled"])
+            log(f"  ⏹️  Servicio ya detenido, deshabilitado: {svc}")
+    if not found_any_service:
+        log("  ℹ️  No se encontraron servicios activos (puede que no esté instalado).")
 
+    # ── 2. Kill running processes ─────────────────────────────────────────
     for proc in CLASSROOM_PROCESSES.get(app_key, []):
         ok, msg = cmd_block_process(proc)
         if ok:
@@ -1094,6 +622,40 @@ def apply_classroom_block(app_key: str, log_callback=None) -> dict:
             log(f"  ✅ Proceso bloqueado: {proc}")
         else:
             log(f"  ℹ️  Proceso no activo: {proc}")
+
+    # ── 3. Apply firewall rules ───────────────────────────────────────────
+    log("  🔒 Aplicando reglas de firewall...")
+    for rule in rules:
+        name = rule["name"]
+        proto = rule["proto"]
+        direction = rule["dir"]
+        full_name = f"{RULE_PREFIX}{name}"
+
+        # Check if rule already exists — skip silently
+        if _rule_exists(full_name):
+            results["skipped"] += 1
+            results["ok"] += 1
+            if "port_range" in rule:
+                label = f"{proto} {rule['port_range']} {direction.upper()}"
+            else:
+                label = f"{proto} {rule['port']} {direction.upper()}"
+            log(f"  ⏭️  Ya existía: {label}")
+            continue
+
+        if "port_range" in rule:
+            ok, msg = _block_port_range(rule["port_range"], proto, direction, name)
+            label = f"{proto} {rule['port_range']} {direction.upper()}"
+        else:
+            port = rule["port"]
+            ok, msg, _ = cmd_block_port(port, proto, direction)
+            label = f"{proto} {port} {direction.upper()}"
+
+        if ok:
+            results["ok"] += 1
+            log(f"  ✅ Bloqueado: {label}  →  {full_name}")
+        else:
+            results["fail"] += 1
+            log(f"  ❌ Error {label}: {msg[:80]}")
 
     return results
 
@@ -1160,31 +722,32 @@ def create_persistent_startup_task(app_key: str) -> tuple[bool, str]:
 def disable_classroom_services(app_key: str) -> list[str]:
     results = []
     for svc in CLASSROOM_SERVICES.get(app_key, []):
-        ok, msg = _run(["sc", "config", svc, "start=", "disabled"])
-        _run(["sc", "stop", svc])
-        if ok:
-            results.append(f"  ✅ Servicio deshabilitado: {svc}")
-        else:
+        status = check_service_status(svc)
+        if status == "not_found":
             results.append(f"  ℹ️  Servicio no encontrado: {svc}")
+            continue
+        # Stop first, then disable
+        _run(["sc", "stop", svc])
+        ok, msg = _run(["sc", "config", svc, "start=", "disabled"])
+        if ok:
+            results.append(f"  ✅ Servicio deshabilitado y detenido: {svc}")
+        else:
+            results.append(f"  ⚠️  Error al deshabilitar {svc}: {msg[:60]}")
     return results
 
 
 # ─── CONSOLE COMMAND PARSER ──────────────────────────────────────────────────
 
 COMMANDS = [
-    ("block-port ",        "block-port <puerto> [tcp|udp] [in|out|both]"),
-    ("unblock-port ",      "unblock-port <puerto> [tcp|udp] [in|out|both]"),
-    ("block-ip ",          "block-ip <ip o CIDR> — bloquea una IP/rango completamente"),
-    ("unblock-ip ",        "unblock-ip <ip o CIDR> — desbloquea una IP"),
-    ("block-listip",       "block-listip — carga un .txt/.md con lista de IPs y las bloquea"),
-    ("unblock-listip",     "unblock-listip — carga un .txt/.md con lista de IPs y las desbloquea"),
+    ("block-port ",        "block-port <puerto> [tcp|udp] [in|out]"),
+    ("unblock-port ",      "unblock-port <puerto> [tcp|udp] [in|out]"),
     ("block-app ",         "block-app <ruta_exe>"),
     ("block-process ",     "block-process <nombre>"),
     ("block-insight",      "block-insight — bloquea Faronics Insight Student"),
     ("unblock-insight",    "unblock-insight — desbloquea Faronics Insight"),
     ("block-reboot",       "block-reboot — bloquea Reboot Restore Enterprise"),
     ("unblock-reboot",     "unblock-reboot — desbloquea Reboot Restore"),
-    ("list",               "list — muestra todos los puertos e IPs bloqueados por FyreWall"),
+    ("list",               "list — muestra todos los puertos bloqueados por FyreWall"),
     ("flush",              "flush — elimina todas las reglas FyreWall"),
     ("isolate",            "isolate — bloquea TODO el tráfico"),
     ("unisolate",          "unisolate — restaura la red"),
@@ -1213,50 +776,19 @@ HELP_TEXT = """\
 
   PUERTOS
   ─────────────────────────────────────────────────────────────
-  block-port <puerto> [tcp|udp] [in|out|both]
-      Bloquea un puerto con reglas REALES en el Firewall de
-      Windows (netsh advfirewall). Por defecto bloquea entrada
-      Y salida (both). Las reglas son PERSISTENTES: siguen
-      activas aunque cierres FyreWall o reinicies el equipo.
+  block-port <puerto> [tcp|udp] [in|out]
+      Bloquea un puerto. Protocolo y dirección son opcionales.
       Ej: block-port 8080
-          block-port 3389 tcp both
-          block-port 22 tcp in
+          block-port 3389 tcp in
 
-  unblock-port <puerto> [tcp|udp] [in|out|both]
-      Elimina las reglas de bloqueo para ese puerto.
-      Por defecto elimina entrada Y salida.
+  unblock-port <puerto> [tcp|udp] [in|out]
+      Elimina la regla de bloqueo para ese puerto.
 
   status <puerto>
-      Consulta el Firewall de Windows en tiempo real para
-      comprobar si ese puerto tiene reglas de bloqueo activas.
+      Comprueba si hay una regla de bloqueo para ese puerto.
 
-  list
-      Muestra TODAS las reglas FyreWall activas en el
-      Firewall de Windows (no solo en memoria).
-
-  IPs
+  APLICACIONES
   ─────────────────────────────────────────────────────────────
-  block-ip <ip o CIDR>
-      Bloquea una IP o rango de red completo (entrada + salida).
-      Todo el tráfico de/hacia esa IP será rechazado.
-      Regla persistente — sobrevive a reinicios.
-      Ej: block-ip 192.168.1.100
-          block-ip 10.0.0.0/8
-          block-ip 2001:db8::1
-
-  unblock-ip <ip o CIDR>
-      Elimina las reglas de bloqueo para esa IP o rango.
-
-  block-listip
-      Abre el explorador de archivos para seleccionar un
-      archivo .txt / .md / .csv con una lista de IPs:
-        192.168.1.1
-        10.0.0.0/8
-        # esto es un comentario
-        172.16.0.5
-      Se bloquean todas en una sola operación.
-
-
   block-app <ruta_exe>
       Bloquea el tráfico saliente de un ejecutable específico.
 
@@ -1268,7 +800,7 @@ HELP_TEXT = """\
   block-insight
       Bloquea Faronics Insight Student (todos los puertos y
       procesos conocidos: UDP/TCP 796, 11796, 1053, WS 8888-
-      8890, RC 10000-20000). Reglas persistentes.
+      8890, RC 10000-20000).
 
   unblock-insight
       Desbloquea Faronics Insight Student.
@@ -1282,23 +814,36 @@ HELP_TEXT = """\
   SISTEMA
   ─────────────────────────────────────────────────────────────
   get-suspicious
-      Analiza los puertos activos en busca de actividad
-      sospechosa: compartir pantalla (VNC, RDP, TeamViewer…),
-      compartir archivos (SMB, FTP, WebDAV…) y telemetría.
+      Analiza los puertos activos en busca de actividad sospechosa:
+      compartir pantalla (VNC, RDP, TeamViewer…), compartir archivos
+      (SMB, FTP, WebDAV…) y envío de diagnósticos/telemetría.
+      Muestra qué proceso usa cada puerto y permite bloquearlo.
 
   get-admin
       Solicita privilegios de Administrador a Windows (UAC).
+      Si ya eres admin, lo indica.
 
   get-ip
-      Muestra todas las redes locales y tu IP pública.
+      Muestra todas las redes locales a las que estás conectado
+      y tu dirección IP pública actual.
 
   ARCHIVOS BATCH
   ─────────────────────────────────────────────────────────────
-  get-bat / ls / run-bat <archivo.bat>
-      Explorar y ejecutar scripts .bat del directorio.
+  get-bat
+      Abre un explorador de archivos para seleccionar un .bat
+      y ejecutarlo en una nueva pestaña "Batch".
+
+  ls
+      Lista todos los archivos del directorio donde está FyreWall.
+      Los archivos .bat se marcan y pueden ejecutarse con run-bat.
+
+  run-bat <archivo.bat>
+      Ejecuta un archivo .bat del directorio de FyreWall en una
+      nueva pestaña "Batch" (con autocompletado por Tab).
 
   GENERAL
   ─────────────────────────────────────────────────────────────
+  list      Lista TODOS los puertos bloqueados por FyreWall.
   flush     Elimina TODAS las reglas creadas por FyreWall.
   isolate   Bloquea TODO el tráfico de red.
   unisolate Restaura el acceso a la red.
@@ -1311,10 +856,6 @@ HELP_TEXT = """\
   monitor     Abre el Debug Monitor de conexiones.
   aula        Abre el panel de Bloqueo de Aula.
   help        Muestra esta ayuda.
-
-  ⚠️  NOTA: Todas las reglas de bloqueo son PERSISTENTES en el
-  Firewall de Windows. No desaparecen al cerrar FyreWall.
-  Usa 'unblock-port' o 'flush' para eliminarlas.
 ──────────────────────────────────────────────────────────────
 """
 
@@ -1387,79 +928,16 @@ def parse_and_run(command: str) -> tuple[str, str]:
         return f"__RUN_BAT__{bat_path}", "info"
 
     if cmd == "list":
-        rules = cmd_list_rules()
-        if not rules:
-            return (
-                "No hay reglas FyreWall en el Firewall de Windows.\n"
-                "(Usa 'block-port <puerto>' o 'block-ip <ip>' para empezar.)",
-                "warn"
-            )
-        ports = {k: v for k, v in rules.items() if v["type"] == "port"}
-        ips   = {k: v for k, v in rules.items() if v["type"] == "ip"}
-        apps  = {k: v for k, v in rules.items() if v["type"] == "app"}
-        other = {k: v for k, v in rules.items() if v["type"] == "rule"}
-
-        lines = [f"Reglas FyreWall activas en el Firewall de Windows:", "─" * 56]
-
-        if ports:
-            lines.append(f"\n  🔒 PUERTOS BLOQUEADOS ({len(ports)})")
-            for key, info in sorted(ports.items()):
-                dirs = ", ".join(info["dirs"]) if info["dirs"] else "—"
-                ena  = "✅" if info.get("enabled", "True") in ("True", "Yes", "1") else "⚠️ desactivada"
-                lines.append(f"     Puerto {info['port']:>12s} / {info['proto']:<5s}  dirs: {dirs}  {ena}")
-
-        if ips:
-            lines.append(f"\n  🌐 IPs BLOQUEADAS ({len(ips)})")
-            for key, info in sorted(ips.items()):
-                dirs = ", ".join(info["dirs"]) if info["dirs"] else "—"
-                ena  = "✅" if info.get("enabled", "True") in ("True", "Yes", "1") else "⚠️ desactivada"
-                lines.append(f"     {info['remote']:<22s}  dirs: {dirs}  {ena}")
-
-        if apps:
-            lines.append(f"\n  💻 APLICACIONES BLOQUEADAS ({len(apps)})")
-            for key, info in sorted(apps.items()):
-                dirs = ", ".join(info["dirs"]) if info["dirs"] else "—"
-                prog = os.path.basename(info.get("program", "?"))
-                lines.append(f"     {prog:<30s}  dirs: {dirs}")
-
-        if other:
-            lines.append(f"\n  ⚙️  OTRAS REGLAS ({len(other)})")
-            for key, info in sorted(other.items()):
-                lines.append(f"     {info['name']}")
-
-        total = len(rules)
-        lines.append(f"\n  Total: {total} regla(s) en el Firewall de Windows.")
-        lines.append("  Usa 'flush' para eliminar todas o 'unblock-port'/'unblock-ip' individualmente.")
+        ports = cmd_list_rules()
+        if not ports:
+            return "No hay puertos bloqueados por FyreWall.\n(Usa 'block-port <puerto>' para bloquear uno.)", "warn"
+        lines = ["Puertos bloqueados por FyreWall:", "─" * 50]
+        for key, info in ports.items():
+            dirs = ", ".join(info["dirs"]) if info["dirs"] else "—"
+            lines.append(f"  🔒 {info['port']:20s}  {info['proto']:5s}  dirs: {dirs}")
+            lines.append(f"     Regla: {info['name']}")
+        lines.append(f"\n  Total: {len(ports)} regla(s)")
         return "\n".join(lines), "info"
-
-    if cmd == "block-ip":
-        if len(parts) < 2:
-            return "Uso: block-ip <ip_o_cidr>\n  Ej: block-ip 192.168.1.100\n      block-ip 10.0.0.0/8", "warn"
-        ip = parts[1]
-        ok, msg, name = cmd_block_ip(ip)
-        if ok:
-            return (
-                f"✅  IP {ip} bloqueada (entrada + salida).\n"
-                f"    Regla persistente — todo el tráfico de/hacia {ip} será rechazado.\n"
-                f"    Usa 'unblock-ip {ip}' para eliminarlo.",
-                "ok"
-            )
-        return f"❌  Error al bloquear IP {ip}:\n{msg}", "error"
-
-    if cmd == "unblock-ip":
-        if len(parts) < 2:
-            return "Uso: unblock-ip <ip_o_cidr>", "warn"
-        ip = parts[1]
-        ok, msg = cmd_unblock_ip(ip)
-        if ok:
-            return f"✅  Reglas de bloqueo para IP {ip} eliminadas.", "ok"
-        return f"❌  Error al desbloquear IP {ip}:\n{msg}", "error"
-
-    if cmd == "block-listip":
-        return "__BLOCK_LISTIP__", "info"
-
-    if cmd == "unblock-listip":
-        return "__UNBLOCK_LISTIP__", "info"
 
     if cmd == "flush":
         ok, msg = cmd_flush_all()
@@ -1493,7 +971,7 @@ def parse_and_run(command: str) -> tuple[str, str]:
 
     if cmd == "block-port":
         if len(parts) < 2:
-            return "Uso: block-port <puerto> [tcp|udp] [in|out|both]", "warn"
+            return "Uso: block-port <puerto> [tcp|udp] [in|out]", "warn"
         try:
             port = int(parts[1])
         except ValueError:
@@ -1501,33 +979,28 @@ def parse_and_run(command: str) -> tuple[str, str]:
         proto = parts[2].upper() if len(parts) > 2 else "TCP"
         if proto not in ("TCP", "UDP"):
             return f"Protocolo inválido: '{proto}'.", "error"
-        direction = parts[3].lower() if len(parts) > 3 else "both"
-        if direction not in ("in", "out", "both"):
-            return f"Dirección inválida: '{direction}'. Usa: in, out, both", "error"
+        direction = parts[3].lower() if len(parts) > 3 else "in"
+        if direction not in ("in", "out"):
+            return f"Dirección inválida: '{direction}'.", "error"
         ok, msg, name = cmd_block_port(port, proto, direction)
-        dirs_str = "entrada+salida" if direction == "both" else direction
         if ok:
-            return (
-                f"✅  Puerto {port}/{proto} bloqueado ({dirs_str}).\n"
-                f"    Regla persistente — sobrevive al cierre de FyreWall y a reinicios.\n"
-                f"    Usa 'unblock-port {port} {proto.lower()}' para eliminarlo.",
-                "ok"
-            )
+            if msg == "ya existe":
+                return f"ℹ️  Puerto {port}/{proto} ({direction}) ya estaba bloqueado.\n    Regla: {name}", "warn"
+            return f"✅  Puerto {port}/{proto} bloqueado ({direction}).\n    Regla: {name}", "ok"
         return f"❌  Error al bloquear puerto {port}:\n{msg}", "error"
 
     if cmd == "unblock-port":
         if len(parts) < 2:
-            return "Uso: unblock-port <puerto> [tcp|udp] [in|out|both]", "warn"
+            return "Uso: unblock-port <puerto> [tcp|udp] [in|out]", "warn"
         try:
             port = int(parts[1])
         except ValueError:
             return f"Puerto inválido: '{parts[1]}'", "error"
         proto = parts[2].upper() if len(parts) > 2 else "TCP"
-        direction = parts[3].lower() if len(parts) > 3 else "both"
+        direction = parts[3].lower() if len(parts) > 3 else "in"
         ok, msg = cmd_unblock_port(port, proto, direction)
-        dirs_str = "entrada+salida" if direction == "both" else direction
         if ok:
-            return f"✅  Regla de bloqueo para puerto {port}/{proto} ({dirs_str}) eliminada.", "ok"
+            return f"✅  Regla de bloqueo para puerto {port}/{proto} ({direction}) eliminada.", "ok"
         return f"❌  Error al desbloquear puerto {port}:\n{msg}", "error"
 
     if cmd == "block-app":
@@ -1558,16 +1031,16 @@ def parse_and_run(command: str) -> tuple[str, str]:
         except ValueError:
             return f"Puerto inválido: '{parts[1]}'", "error"
         results = []
-        any_blocked = False
         for proto in ("TCP", "UDP"):
             for direction in ("in", "out"):
-                blocked = is_port_blocked(port, proto, direction)
-                if blocked:
-                    any_blocked = True
-                icon = "🔒 BLOQUEADO" if blocked else "🔓 libre"
+                name = f"{RULE_PREFIX}Block_{proto}_{direction.upper()}_{port}"
+                ok, out = _run([
+                    "netsh", "advfirewall", "firewall", "show", "rule", f"name={name}",
+                ])
+                active = ok and "No rules match" not in out and name in out
+                icon = "🔒 BLOQUEADO" if active else "🔓 libre"
                 results.append(f"  {proto} {direction:3s}: {icon}")
-        summary = "⛔ Puerto bloqueado en el Firewall de Windows." if any_blocked else "✅ Puerto sin restricciones activas."
-        return f"Estado del puerto {port}:\n" + "\n".join(results) + f"\n  {summary}", "info"
+        return f"Estado del puerto {port}:\n" + "\n".join(results), "info"
 
     return f"Comando desconocido: '{cmd}'\nEscribe 'help' para ver los comandos disponibles.", "warn"
 
@@ -2760,7 +2233,7 @@ class FyreWallApp(tk.Tk):
                  font=FONTS["small"],
                  bg=COLORS["surface"], fg=COLORS["text_muted"], anchor="w").pack(side="left")
 
-        tk.Label(bar, text="FyreWall v2.2 — Monitor + Consola + Bloqueo Aula",
+        tk.Label(bar, text="FyreWall v2.1 — Monitor + Consola + Bloqueo Aula",
                  font=FONTS["small"],
                  bg=COLORS["surface"], fg=COLORS["border"]).pack(side="right", padx=12)
 
@@ -2785,7 +2258,7 @@ class FyreWallApp(tk.Tk):
         # Open only the terminal tab at start
         self._open_tab("terminal", "⌨️ Terminal")
 
-        self._console_write("FyreWall v2.2 — Monitor + Consola + Bloqueo de Aula", "header")
+        self._console_write("FyreWall v2.1 — Monitor + Consola + Bloqueo de Aula", "header")
         self._console_write("─" * 60, "muted")
         if not self._admin:
             self._console_write(
@@ -2801,42 +2274,8 @@ class FyreWallApp(tk.Tk):
             "muted"
         )
 
-        # ── Comprobar reglas ya existentes en el firewall ──────────────
-        self._console_write("🔍  Comprobando reglas FyreWall existentes en el firewall...", "muted")
-        threading.Thread(target=self._boot_check_existing_rules, daemon=True).start()
-
-        # Check classroom services in background
+        # Check services in background
         self._check_services_async()
-
-    def _boot_check_existing_rules(self):
-        """Consulta el firewall real y notifica qué reglas FyreWall ya están activas."""
-        existing = cmd_list_rules()
-
-        def render():
-            if existing:
-                self._console_write(
-                    f"📋  {len(existing)} regla(s) FyreWall activa(s) en el Firewall de Windows:",
-                    "warn"
-                )
-                for key, info in existing.items():
-                    dirs = ", ".join(info["dirs"]) if info["dirs"] else "—"
-                    enabled = info.get("enabled", "Yes")
-                    self._console_write(
-                        f"  🔒 Puerto {info['port']:20s}  {info['proto']:5s}  "
-                        f"dirs: {dirs}  [{'✅ activa' if enabled == 'Yes' else '⚠️ deshabilitada'}]",
-                        "ok"
-                    )
-                self._console_write(
-                    "    Usa 'list' para ver el detalle completo.\n",
-                    "muted"
-                )
-            else:
-                self._console_write(
-                    "✅  No hay reglas FyreWall previas en el firewall.\n",
-                    "ok"
-                )
-
-        self.after(0, render)
 
     def _check_services_async(self):
         """Check if classroom services are running and update banner."""
@@ -2849,68 +2288,48 @@ class FyreWallApp(tk.Tk):
         insight = status["insight"]
         rr      = status["rebootrestore"]
 
-        def _fmt_detail(info: dict) -> str:
-            d = info.get("detail", [])
-            return d[0] if d else info.get("service") or "detectado"
-
-        # ── Insight ────────────────────────────────────────────────────
+        # Insight
         if insight["status"] == "running":
-            detail = _fmt_detail(insight)
             self._insight_svc_lbl.config(
-                text=f"🔴 Insight ACTIVO  ({detail})",
+                text=f"🔴 Insight ACTIVO ({insight['service']})",
                 fg=COLORS["danger"]
             )
             self._console_write(
-                f"⚠️  DETECTADO: Faronics Insight está ACTIVO.", "warn"
+                f"⚠️  SERVICIO ACTIVO: Faronics Insight ({insight['service']}) está CORRIENDO.",
+                "warn"
             )
-            for d in insight.get("detail", []):
-                self._console_write(f"    → {d}", "muted")
             self._console_write(
-                "    Usa 'block-insight' o ve a la pestaña Aula para bloquearlo.", "muted"
+                "    Usa 'block-insight' para bloquearlo, o ve a la pestaña Aula.", "muted"
             )
         elif insight["status"] == "stopped":
-            detail = _fmt_detail(insight)
             self._insight_svc_lbl.config(
-                text=f"🟡 Insight instalado, no activo  ({detail})",
+                text=f"🟡 Insight detenido ({insight['service']})",
                 fg=COLORS["warning"]
             )
-            self._console_write(
-                "⚠️  Faronics Insight está instalado pero no activo en este momento.", "warn"
-            )
-            for d in insight.get("detail", []):
-                self._console_write(f"    → {d}", "muted")
         else:
             self._insight_svc_lbl.config(
                 text="✅ Insight: no detectado",
                 fg=COLORS["success"]
             )
 
-        # ── Reboot Restore ─────────────────────────────────────────────
+        # Reboot Restore
         if rr["status"] == "running":
-            detail = _fmt_detail(rr)
             self._rr_svc_lbl.config(
-                text=f"🔴 Reboot Restore ACTIVO  ({detail})",
+                text=f"🔴 Reboot Restore ACTIVO ({rr['service']})",
                 fg=COLORS["danger"]
             )
             self._console_write(
-                "⚠️  DETECTADO: Reboot Restore está ACTIVO.", "warn"
+                f"⚠️  SERVICIO ACTIVO: Reboot Restore ({rr['service']}) está CORRIENDO.",
+                "warn"
             )
-            for d in rr.get("detail", []):
-                self._console_write(f"    → {d}", "muted")
             self._console_write(
-                "    Usa 'block-reboot' o ve a la pestaña Aula para bloquearlo.", "muted"
+                "    Usa 'block-reboot' para bloquearlo, o ve a la pestaña Aula.", "muted"
             )
         elif rr["status"] == "stopped":
-            detail = _fmt_detail(rr)
             self._rr_svc_lbl.config(
-                text=f"🟡 Reboot Restore instalado, no activo  ({detail})",
+                text=f"🟡 Reboot Restore detenido ({rr['service']})",
                 fg=COLORS["warning"]
             )
-            self._console_write(
-                "⚠️  Reboot Restore está instalado pero no activo en este momento.", "warn"
-            )
-            for d in rr.get("detail", []):
-                self._console_write(f"    → {d}", "muted")
         else:
             self._rr_svc_lbl.config(
                 text="✅ Reboot Restore: no detectado",
@@ -3049,13 +2468,11 @@ class FyreWallApp(tk.Tk):
         proc  = row["process"]
         if not messagebox.askyesno(
             "Bloquear puerto",
-            f"¿Bloquear el puerto {port}/{proto} (entrada + salida)?\n"
-            f"Proceso: {proc}\n\n"
-            "Esto añadirá reglas persistentes en el Firewall de Windows.\n"
-            "Las reglas seguirán activas aunque cierres FyreWall."
+            f"¿Bloquear el puerto {port}/{proto}?\nProceso: {proc}\n\n"
+            "Esto añadirá una regla de Firewall de Windows."
         ):
             return
-        cmd = f"block-port {port} {proto.lower()} both"
+        cmd = f"block-port {port} {proto.lower()} in"
         self._exec_console(cmd)
 
     def _ctx_block_port(self):
@@ -3150,12 +2567,6 @@ class FyreWallApp(tk.Tk):
             return
         if output == "__GET_BAT__":
             self._do_get_bat()
-            return
-        if output == "__BLOCK_LISTIP__":
-            self._do_block_listip()
-            return
-        if output == "__UNBLOCK_LISTIP__":
-            self._do_unblock_listip()
             return
         if isinstance(output, str) and output.startswith("__RUN_BAT__"):
             bat_path = output[len("__RUN_BAT__"):]
@@ -3274,124 +2685,6 @@ class FyreWallApp(tk.Tk):
             return
         self._console_write(f"▶️  Ejecutando: {os.path.basename(path)}", "ok")
         self._do_run_bat(path)
-
-    def _do_block_listip(self):
-        """Open file dialog, load IP list and block all IPs in background."""
-        path = filedialog.askopenfilename(
-            parent=self,
-            title="Selecciona el archivo con la lista de IPs",
-            initialdir=APP_DIR,
-            filetypes=[
-                ("Archivos de texto", "*.txt *.md *.csv *.list *.conf"),
-                ("Todos los archivos", "*.*"),
-            ],
-        )
-        if not path:
-            self._console_write("ℹ️  Selección de lista de IPs cancelada.", "muted")
-            return
-
-        fname = os.path.basename(path)
-        self._console_write(f"\n🌐  Cargando lista de IPs desde: {fname}", "header")
-        self._console_write("    Procesando...", "muted")
-        self._status_text.set(f"Bloqueando IPs de {fname}...")
-
-        def run():
-            results = cmd_block_ip_list(path)
-
-            def render():
-                ok_list   = results["ok"]
-                fail_list = results["fail"]
-                skipped   = results["skip"]
-
-                if ok_list:
-                    self._console_write(
-                        f"  ✅ {len(ok_list)} IP(s) bloqueadas correctamente:", "ok"
-                    )
-                    for ip in ok_list:
-                        self._console_write(f"     🔒 {ip}", "ok")
-
-                if fail_list:
-                    self._console_write(
-                        f"  ❌ {len(fail_list)} IP(s) con error:", "error"
-                    )
-                    for err in fail_list:
-                        self._console_write(f"     ⚠️  {err}", "warn")
-
-                self._console_write(
-                    f"\n  Resumen: {len(ok_list)} bloqueadas · "
-                    f"{len(fail_list)} errores · {skipped} líneas ignoradas",
-                    "info"
-                )
-                if ok_list:
-                    self._console_write(
-                        "  Usa 'list' para ver todas las reglas activas.\n"
-                        "  Usa 'unblock-ip <ip>' para desbloquear individualmente.",
-                        "muted"
-                    )
-                self._status_text.set(
-                    f"✅ {len(ok_list)} IPs bloqueadas de {fname}"
-                    if ok_list else f"⚠️  0 IPs bloqueadas de {fname}"
-                )
-
-            self.after(0, render)
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _do_unblock_listip(self):
-        """Open file dialog, load IP list and unblock all IPs in background."""
-        path = filedialog.askopenfilename(
-            parent=self,
-            title="Selecciona el archivo con la lista de IPs a desbloquear",
-            initialdir=APP_DIR,
-            filetypes=[
-                ("Archivos de texto", "*.txt *.md *.csv *.list *.conf"),
-                ("Todos los archivos", "*.*"),
-            ],
-        )
-        if not path:
-            self._console_write("ℹ️  Selección de lista de IPs cancelada.", "muted")
-            return
-
-        fname = os.path.basename(path)
-        self._console_write(f"\n🔓  Desbloqueando IPs desde: {fname}", "header")
-        self._console_write("    Procesando...", "muted")
-        self._status_text.set(f"Desbloqueando IPs de {fname}...")
-
-        def run():
-            results = cmd_unblock_ip_list(path)
-
-            def render():
-                ok_list   = results["ok"]
-                fail_list = results["fail"]
-                skipped   = results["skip"]
-
-                if ok_list:
-                    self._console_write(
-                        f"  ✅ {len(ok_list)} IP(s) desbloqueadas correctamente:", "ok"
-                    )
-                    for ip in ok_list:
-                        self._console_write(f"     🔓 {ip}", "ok")
-
-                if fail_list:
-                    self._console_write(
-                        f"  ⚠️  {len(fail_list)} IP(s) con error o no encontradas:", "warn"
-                    )
-                    for err in fail_list:
-                        self._console_write(f"     → {err}", "muted")
-
-                self._console_write(
-                    f"\n  Resumen: {len(ok_list)} desbloqueadas · "
-                    f"{len(fail_list)} errores · {skipped} líneas ignoradas",
-                    "info"
-                )
-                self._status_text.set(
-                    f"✅ {len(ok_list)} IPs desbloqueadas de {fname}"
-                    if ok_list else f"⚠️  0 IPs desbloqueadas de {fname}"
-                )
-
-            self.after(0, render)
-
-        threading.Thread(target=run, daemon=True).start()
 
     def _do_run_bat(self, bat_path: str):
         """Open (or reuse) Batch tab and run the .bat there."""
@@ -3704,19 +2997,32 @@ class FyreWallApp(tk.Tk):
             )
             def done():
                 total = results["ok"] + results["fail"]
-                self._classroom_log_write(
-                    f"\n✅ Completado: {results['ok']}/{total} reglas aplicadas.", "ok")
+                skipped = results.get("skipped", 0)
+                new_rules = results["ok"] - skipped
+                if results["fail"] == 0:
+                    self._classroom_log_write(
+                        f"\n✅ Completado: {results['ok']}/{total} reglas OK "
+                        f"({new_rules} nuevas, {skipped} ya existían).", "ok")
+                else:
+                    self._classroom_log_write(
+                        f"\n⚠️  Completado con errores: {results['ok']} OK / {results['fail']} fallidas.", "warn")
                 self._classroom_log_write(
                     "💡 Recuerda crear la tarea de inicio para persistencia tras reinicio.", "warn")
-                if app_key == "insight":
-                    self._insight_blocked = True
-                    self._insight_status_var.set("⬤ BLOQUEADO")
-                    self._insight_status_label.config(fg=COLORS["danger"])
+                # Only update status to BLOQUEADO if at least some rules were applied
+                if results["ok"] > 0:
+                    if app_key == "insight":
+                        self._insight_blocked = True
+                        self._insight_status_var.set("⬤ BLOQUEADO")
+                        self._insight_status_label.config(fg=COLORS["danger"])
+                    else:
+                        self._rr_blocked = True
+                        self._rr_status_var.set("⬤ BLOQUEADO")
+                        self._rr_status_label.config(fg=COLORS["danger"])
+                    self._status_text.set(f"✅  {app_name} bloqueado")
                 else:
-                    self._rr_blocked = True
-                    self._rr_status_var.set("⬤ BLOQUEADO")
-                    self._rr_status_label.config(fg=COLORS["danger"])
-                self._status_text.set(f"✅  {app_name} bloqueado")
+                    self._classroom_log_write(
+                        f"❌ No se pudo aplicar ninguna regla. ¿Tienes permisos de Administrador?", "error")
+                    self._status_text.set(f"❌  Error bloqueando {app_name}")
             self.after(0, done)
 
         threading.Thread(target=run, daemon=True).start()
