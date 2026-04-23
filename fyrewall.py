@@ -1612,6 +1612,268 @@ class RequestsTab(tk.Frame):
         super().destroy()
 
 
+# ─── REMOTE TERMINAL TAB ──────────────────────────────────────────────────────
+
+class RemoteTerminalTab(tk.Frame):
+    """
+    Pestaña de terminal remota interactiva para un PC del aula.
+    Ejecuta comandos en el host remoto via PowerShell + SMB (IPC$).
+    """
+
+    def __init__(self, parent, app, ip: str, user: str, password: str):
+        super().__init__(parent, bg=COLORS["bg"])
+        self._app      = app
+        self._ip       = ip
+        self._user     = user
+        self._password = password
+        self._history: list[str] = []
+        self._hist_idx = -1
+        self._connected = False
+        self._proc      = None   # proceso PowerShell remoto activo
+
+        self._build_ui()
+        self.after(100, self._connect)
+
+    def _build_ui(self):
+        # ── Header ────────────────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=COLORS["surface"], pady=8, padx=12)
+        hdr.pack(fill="x")
+
+        self._status_dot = tk.Label(
+            hdr, text="●",
+            font=("Segoe UI", 12),
+            bg=COLORS["surface"], fg=COLORS["warning"],
+        )
+        self._status_dot.pack(side="left", padx=(0, 6))
+
+        tk.Label(
+            hdr, text=f"CONSOLA REMOTA  —  {self._ip}",
+            font=FONTS["label"],
+            bg=COLORS["surface"], fg=COLORS["accent"],
+        ).pack(side="left")
+
+        self._status_lbl = tk.Label(
+            hdr, text="Conectando...",
+            font=FONTS["small"],
+            bg=COLORS["surface"], fg=COLORS["text_muted"],
+        )
+        self._status_lbl.pack(side="left", padx=12)
+
+        tk.Button(
+            hdr, text="🗑  Limpiar",
+            command=self._clear,
+            bg=COLORS["btn"], fg=COLORS["text_muted"],
+            font=FONTS["small"], relief="flat", cursor="hand2",
+            padx=8, pady=3, activebackground=COLORS["btn_hover"],
+        ).pack(side="right")
+
+        tk.Button(
+            hdr, text="⟳  Reconectar",
+            command=self._connect,
+            bg=COLORS["btn"], fg=COLORS["text_muted"],
+            font=FONTS["small"], relief="flat", cursor="hand2",
+            padx=8, pady=3, activebackground=COLORS["btn_hover"],
+        ).pack(side="right", padx=(0, 6))
+
+        # ── Output ────────────────────────────────────────────────────────
+        out_frame = tk.Frame(self, bg=COLORS["console_bg"])
+        out_frame.pack(fill="both", expand=True, padx=12, pady=(8, 0))
+
+        self._out = tk.Text(
+            out_frame,
+            bg=COLORS["console_bg"], fg=COLORS["console_text"],
+            font=FONTS["mono_lg"], relief="flat", bd=0,
+            state="disabled", wrap="word", padx=12, pady=10, cursor="arrow",
+        )
+        sb = ttk.Scrollbar(out_frame, orient="vertical", command=self._out.yview)
+        self._out.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._out.pack(side="left", fill="both", expand=True)
+
+        self._out.tag_configure("prompt",  foreground=COLORS["console_prompt"], font=("Consolas", 10, "bold"))
+        self._out.tag_configure("ok",      foreground=COLORS["console_ok"])
+        self._out.tag_configure("error",   foreground=COLORS["console_err"])
+        self._out.tag_configure("warn",    foreground=COLORS["console_warn"])
+        self._out.tag_configure("info",    foreground=COLORS["console_text"])
+        self._out.tag_configure("muted",   foreground=COLORS["console_info"])
+
+        # ── Input ─────────────────────────────────────────────────────────
+        in_frame = tk.Frame(self, bg=COLORS["console_bg"], pady=6, padx=12)
+        in_frame.pack(fill="x", padx=12, pady=(0, 8))
+
+        tk.Label(
+            in_frame, text=f"{self._ip} ❯",
+            font=("Consolas", 11, "bold"),
+            bg=COLORS["console_bg"], fg=COLORS["console_prompt"],
+        ).pack(side="left", padx=(0, 8))
+
+        self._input_var = tk.StringVar()
+        self._entry = tk.Entry(
+            in_frame,
+            textvariable=self._input_var,
+            bg=COLORS["console_bg"], fg=COLORS["console_text"],
+            font=FONTS["mono_lg"], relief="flat", bd=0,
+            insertbackground=COLORS["console_prompt"],
+        )
+        self._entry.pack(side="left", fill="x", expand=True, ipady=4)
+        self._entry.bind("<Return>", self._on_enter)
+        self._entry.bind("<Up>",     self._hist_up)
+        self._entry.bind("<Down>",   self._hist_down)
+        self._entry.focus_set()
+
+        tk.Button(
+            in_frame, text="Ejecutar",
+            command=lambda: self._on_enter(None),
+            bg=COLORS["accent"], fg="#000000",
+            font=FONTS["button"], relief="flat", cursor="hand2",
+            padx=14, pady=4, activebackground=COLORS["accent_hover"],
+        ).pack(side="right")
+
+    # ── Connection ────────────────────────────────────────────────────────
+
+    def _connect(self):
+        """Monta IPC$ via SMB y verifica conectividad."""
+        self._set_status("Conectando via SMB...", COLORS["warning"])
+        self._write(f"  Conectando a {self._ip} via SMB (IPC$)...\n", "muted")
+
+        def _do():
+            # Montar IPC$ via net use (SMB 445/139)
+            ps = (
+                f"net use \\\\{self._ip}\\IPC$ '{self._password}' "
+                f"/user:{self._user} 2>&1"
+            )
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                    capture_output=True, text=True, timeout=12,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                ok = r.returncode == 0 or "already" in (r.stdout + r.stderr).lower()
+            except Exception as e:
+                ok = False
+                r = type("R", (), {"stdout": str(e), "stderr": ""})()
+
+            if ok:
+                self.after(0, lambda: self._set_status(f"Conectado a {self._ip}", COLORS["success"]))
+                self.after(0, lambda: self._write(
+                    f"  ✅  Conectado a {self._ip} — escribe comandos PowerShell\n"
+                    f"  (se ejecutan en el PC remoto via WMI + SMB)\n\n", "ok"
+                ))
+                self._connected = True
+            else:
+                err = (r.stdout + r.stderr).strip()[:200]
+                self.after(0, lambda: self._set_status("Sin conexión", COLORS["danger"]))
+                self.after(0, lambda: self._write(
+                    f"  ❌  No se pudo conectar a {self._ip}\n  {err}\n\n", "error"
+                ))
+                self._connected = False
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ── Command execution ─────────────────────────────────────────────────
+
+    def _on_enter(self, event):
+        cmd = self._input_var.get().strip()
+        if not cmd:
+            return
+        self._input_var.set("")
+        self._history.append(cmd)
+        self._hist_idx = -1
+        self._write(f"\n{self._ip} ❯ {cmd}\n", "prompt")
+        threading.Thread(target=self._run_remote, args=(cmd,), daemon=True).start()
+
+    def _run_remote(self, cmd: str):
+        """Ejecuta un comando en el PC remoto via WMI Win32_Process + salida capturada."""
+        CF = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        # Escapamos el comando para pasarlo como argumento a PowerShell remoto
+        # Usamos Invoke-WmiMethod para ejecutar y capturar salida via archivo temporal
+        tmp_out = f"\\\\{self._ip}\\C$\\Windows\\Temp\\fyre_out_{int(time.time())}.txt"
+
+        # El comando a ejecutar en el PC remoto: cmd /c <comando> > archivo_tmp
+        remote_cmd = f'cmd /c "{cmd}" > C:\\Windows\\Temp\\fyre_out.txt 2>&1'
+        remote_cmd_escaped = remote_cmd.replace("'", "\\'")
+
+        ps_exec = (
+            f"$pw = ConvertTo-SecureString '{self._password}' -AsPlainText -Force; "
+            f"$cred = New-Object System.Management.Automation.PSCredential('{self._user}', $pw); "
+            f"$wmi = Get-WmiObject -Class Win32_Process -ComputerName {self._ip} "
+            f"  -Credential $cred -List -ErrorAction Stop; "
+            f"$r = $wmi.Create('{remote_cmd_escaped}'); "
+            f"$pid2 = $r.ProcessId; "
+            f"Start-Sleep -Milliseconds 1500; "
+            # Leer el archivo de salida via SMB (ya tenemos IPC$ montado)
+            f"Get-Content '\\\\{self._ip}\\C$\\Windows\\Temp\\fyre_out.txt' "
+            f"  -ErrorAction SilentlyContinue; "
+            f"Remove-Item '\\\\{self._ip}\\C$\\Windows\\Temp\\fyre_out.txt' "
+            f"  -Force -ErrorAction SilentlyContinue"
+        )
+
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_exec],
+                capture_output=True, text=True, timeout=30, creationflags=CF,
+            )
+            out = r.stdout.strip() if r.stdout.strip() else r.stderr.strip()
+            if not out:
+                out = "(sin salida)"
+            level = "error" if r.returncode != 0 and not r.stdout.strip() else "info"
+        except subprocess.TimeoutExpired:
+            out   = "⏱  Timeout — el comando tardó demasiado."
+            level = "warn"
+        except Exception as e:
+            out   = f"❌  Error: {e}"
+            level = "error"
+
+        self.after(0, lambda o=out, l=level: self._write(o + "\n", l))
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _write(self, text: str, tag: str = "info"):
+        self._out.configure(state="normal")
+        self._out.insert("end", text, tag)
+        self._out.configure(state="disabled")
+        self._out.see("end")
+
+    def _clear(self):
+        self._out.configure(state="normal")
+        self._out.delete("1.0", "end")
+        self._out.configure(state="disabled")
+
+    def _set_status(self, text: str, color: str):
+        self._status_lbl.config(text=text)
+        self._status_dot.config(fg=color)
+
+    def _hist_up(self, event):
+        if not self._history:
+            return
+        self._hist_idx = min(self._hist_idx + 1, len(self._history) - 1)
+        self._input_var.set(self._history[-(self._hist_idx + 1)])
+        self._entry.icursor("end")
+
+    def _hist_down(self, event):
+        if self._hist_idx <= 0:
+            self._hist_idx = -1
+            self._input_var.set("")
+            return
+        self._hist_idx -= 1
+        self._input_var.set(self._history[-(self._hist_idx + 1)])
+        self._entry.icursor("end")
+
+    def destroy(self):
+        # Desmontar IPC$ al cerrar la pestaña
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"net use \\\\{self._ip}\\IPC$ /delete /y 2>$null"],
+                capture_output=True, timeout=6,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            pass
+        super().destroy()
+
+
 # ─── MAIN APPLICATION ─────────────────────────────────────────────────────────
 
 class FyreWallApp(tk.Tk):
@@ -1807,13 +2069,34 @@ class FyreWallApp(tk.Tk):
         if tab_id in closeable and tab_id in self._tab_frames:
             self._tab_frames[tab_id].destroy()
             del self._tab_frames[tab_id]
-        elif tab_id.startswith("plugin_") and tab_id in self._tab_frames:
+        elif (tab_id.startswith("plugin_") or tab_id.startswith("remote_")) and tab_id in self._tab_frames:
             self._tab_frames[tab_id].destroy()
             del self._tab_frames[tab_id]
         self._tab_bar.remove_tab(tab_id)
         # If no tabs remain, show empty state
         if not self._tab_bar._tabs:
             self._show_empty_state()
+
+    def open_remote_tab(self, ip: str, user: str = "", password: str = ""):
+        """
+        Abre (o activa si ya existe) una pestaña de terminal remota para la IP dada.
+        Llamado desde ipmanager.py al ejecutar 'ip admin-pc <ip>'.
+        """
+        tab_id = f"remote_{ip}"
+        label  = f"🖥️  {ip}"
+
+        # Si ya existe, solo activarla
+        if tab_id in self._tab_frames:
+            self._tab_bar.activate(tab_id)
+            return
+
+        frame = RemoteTerminalTab(
+            self._content, self, ip, user, password,
+        )
+        self._tab_frames[tab_id] = frame
+        self._tab_bar.add_tab(tab_id, label)
+
+
 
     # ── Terminal Tab ───────────────────────────────────────────────────────
 
@@ -2357,6 +2640,14 @@ class FyreWallApp(tk.Tk):
     def _boot(self):
         # Load installed plugins before opening terminal
         _load_all_plugins()
+        # Inyectar referencia a la app en todos los plugins que la soporten
+        for entry in _PLUGINS.values():
+            mod = entry.get("module")
+            if mod and callable(getattr(mod, "_set_app", None)):
+                try:
+                    mod._set_app(self)
+                except Exception:
+                    pass
 
         # Open only the terminal tab at start
         self._open_tab("terminal", "⌨️ Terminal")
