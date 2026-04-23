@@ -14,7 +14,11 @@ import os
 import sys
 import random
 import socket
-from PIL import Image, ImageTk
+try:
+    from PIL import Image, ImageTk
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 # ─── THEME ───────────────────────────────────────────────────────────────────
 
@@ -1632,7 +1636,7 @@ class FyreWallApp(tk.Tk):
 
         self._insight_blocked = False
         self._rr_blocked = False
-        self._fake_image: ImageTk.PhotoImage | None = None
+        self._fake_image: object = None
         self._fake_image_path: str = ""
         self._autocomplete_popup: tk.Toplevel | None = None
 
@@ -2213,6 +2217,14 @@ class FyreWallApp(tk.Tk):
             filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.bmp *.gif"), ("Todos", "*.*")]
         )
         if not path:
+            return
+        if not _PIL_AVAILABLE:
+            img_var.set(f"✅ {os.path.basename(path)}")
+            img_canvas.config(image="", text="[Vista previa no disponible\nPillow bloqueado]",
+                              bg=COLORS["bg"], fg=COLORS["text_muted"])
+            self._classroom_log_write(
+                f"\n🖼️  Imagen seleccionada {app_key}: {os.path.basename(path)}\n"
+                "⚠️  Vista previa deshabilitada (Pillow bloqueado por el sistema)", "warn")
             return
         try:
             img = Image.open(path)
